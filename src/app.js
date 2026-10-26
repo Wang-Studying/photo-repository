@@ -1663,6 +1663,7 @@
   let phoneGroups = [];
   let phonePicked = new Set();
   let phoneBusy = false;
+  let phoneCancelPending = false;
 
   function formatSize(n) {
     if (!n) return '';
@@ -1786,6 +1787,8 @@
     listEl.classList.add('hidden');
     toolbar.classList.add('hidden');
     tip.classList.add('hidden');
+    $('#phone-import-progress').className = 'phone-import-progress hidden';
+    phoneCancelPending = false;
     syncPhoneSelection();
     stateEl.className = 'phone-detect-state';
     stateEl.textContent = '正在检测设备…';
@@ -1887,30 +1890,86 @@
 
   function updatePhoneImportButton() {
     const btn = $('#phone-import-selected');
+    const cancel = $('#phone-cancel-import');
     btn.disabled = phoneBusy || phonePicked.size === 0;
-    if (phoneBusy) btn.textContent = '正在导入…';
+    if (phoneBusy) btn.textContent = phoneCancelPending ? '正在取消…' : '正在导入…';
     else if (phonePicked.size) btn.textContent = `导入所选（${phonePicked.size}）`;
     else btn.textContent = '导入所选';
+    // 导入期间才出现「取消导入」，位置始终在固定底栏内
+    cancel.classList.toggle('hidden', !phoneBusy);
+    cancel.disabled = phoneCancelPending;
+    cancel.textContent = phoneCancelPending ? '正在取消…' : '取消导入';
+  }
+
+  /** 取消导入：只置标记，已开始的条目继续完成，未开始的条目在下一个条目边界截止 */
+  async function requestPhoneCancel() {
+    if (!phoneBusy || phoneCancelPending) return;
+    phoneCancelPending = true;
+    updatePhoneImportButton();
+    $('#phone-import-phase').textContent = '正在取消…';
+    $('#phone-import-sub').textContent = '已开始的条目会继续完成，未开始的条目不再导入';
+    try { await api.phone.cancelImport(); } catch {}
+  }
+
+  /** 手机导入进度条：覆盖「从手机复制 → 入库」两个阶段，实时刷新 */
+  function renderPhoneImportProgress(p) {
+    const box = $('#phone-import-progress');
+    if (!box || box.classList.contains('hidden')) return;
+    const phaseEl = $('#phone-import-phase');
+    const curEl = $('#phone-import-current');
+    const fill = $('#phone-import-fill');
+    const sub = $('#phone-import-sub');
+    const total = p.total || 0;
+    const name = String(p.current || '').split(/[\\/]/).pop();
+    if (p.phase === 'copy') {
+      // 复制阶段按文件计数，单文件内再按已落地字节平滑，避免大视频时进度条长时间不动
+      const frac = p.fileTotal > 0 ? Math.min(1, (p.fileDone || 0) / p.fileTotal) : 0;
+      const pct = total ? Math.min(100, Math.round(((p.done + frac) / total) * 100)) : 0;
+      const itemTotal = p.itemTotal || 0;
+      const itemDone = p.itemDone || 0;
+      phaseEl.textContent = phoneCancelPending
+        ? `正在取消… 已完成 ${itemDone}/${itemTotal} 项`
+        : `第 1/2 步 · 正在从手机复制 ${itemTotal ? Math.min(itemDone + 1, itemTotal) : 0}/${itemTotal} 项 · ${pct}%`;
+      sub.textContent = phoneCancelPending ? '已开始的条目会继续完成，未开始的条目不再导入' : '直接写入照片存储位置，不再经过系统盘中转';
+      curEl.textContent = name;
+      fill.style.width = `${pct}%`;
+    } else if (p.phase === 'import') {
+      const pct = total ? Math.min(100, Math.round((p.done / total) * 100)) : 0;
+      phaseEl.textContent = phoneCancelPending
+        ? `正在完成已开始的条目 · 已入库 ${p.done}/${total}`
+        : `第 2/2 步 · 正在入库 ${p.done}/${total} · ${pct}%`;
+      sub.textContent = `新增 ${p.added || 0} · 跳过 ${p.skipped || 0}`;
+      curEl.textContent = name;
+      fill.style.width = `${pct}%`;
+    }
   }
 
   async function importFromPhone() {
     if (phoneBusy) return;
     const picked = phoneGroups.filter((g) => phonePicked.has(g.id));
-    const rels = picked.reduce((acc, g) => acc.concat(g.files || []), []);
+    // 按「条目」分组传给主进程：实况的图片+视频同一组，取消时整条一起截断
+    const groups = picked.map((g) => (g.files || []).filter(Boolean)).filter((g) => g.length);
+    const rels = groups.reduce((acc, g) => acc.concat(g), []);
     if (!rels.length) return;
     const stateEl = $('#phone-detect-state');
     const refresh = $('#phone-refresh');
+    const progBox = $('#phone-import-progress');
     phoneBusy = true;
+    phoneCancelPending = false;
     refresh.disabled = true;
     updatePhoneImportButton();
     stateEl.className = 'phone-detect-state on';
-    stateEl.innerHTML = `<span class="dot-on"></span>正在从手机复制 ${rels.length} 个文件…`;
-    const off = api.on('import-progress', (p) => {
-      const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
-      stateEl.innerHTML = `<span class="dot-on"></span>正在入库 ${p.done}/${p.total} · ${pct}%`;
+    stateEl.innerHTML = `<span class="dot-on"></span>正在导入 ${picked.length} 项（共 ${rels.length} 个文件）…`;
+    progBox.className = 'phone-import-progress';
+    $('#phone-import-phase').textContent = '第 1/2 步 · 正在从手机复制…';
+    $('#phone-import-current').textContent = '';
+    $('#phone-import-fill').style.width = '0%';
+    $('#phone-import-sub').textContent = '';
+    const off = api.on('phone-import-progress', (p) => {
+      if (p && p.phase) renderPhoneImportProgress(p);
     });
     try {
-      const res = await api.phone.importSelected(rels);
+      const res = await api.phone.importSelected(groups);
       off();
       if (!res || !res.ok) throw new Error((res && res.error) || '导入失败');
       const s = res.data.summary || {};
@@ -1918,20 +1977,50 @@
       if (s.skipped) parts.push(`重复跳过 ${s.skipped}`);
       if (s.live) parts.push(`实况 ${s.live}`);
       if (s.failed && s.failed.length) parts.push(`失败 ${s.failed.length}`);
-      toast(`手机导入完成：${parts.join(' · ')}`, (s.failed && s.failed.length) ? 'error' : 'success');
-      if (res.data.copy && res.data.copy.failed && res.data.copy.failed.length) {
-        toast(`${res.data.copy.failed.length} 个文件复制失败，已跳过`, 'error');
+      if (res.data.cancelled) {
+        // 取消态：报告「已完成 / 未导入」条数，未导入数即取消时尚未开始的条目，之后不再增加
+        const processed = typeof s.processed === 'number'
+          ? s.processed
+          : (s.added || 0) + (s.skipped || 0) + ((s.failed && s.failed.length) || 0);
+        const remain = Math.max(0, picked.length - processed);
+        const pct = picked.length ? Math.round((processed / picked.length) * 100) : 0;
+        progBox.classList.add('cancelled');
+        $('#phone-import-phase').textContent = '⏹ 已取消导入';
+        $('#phone-import-current').textContent = '';
+        $('#phone-import-fill').style.width = `${pct}%`;
+        $('#phone-import-sub').textContent = `已完成 ${processed} 项（${parts.join(' · ')}）· 未导入 ${remain} 项`;
+        stateEl.innerHTML = `<span class="dot-on"></span>已取消：完成 ${processed} 项，未导入 ${remain} 项`;
+        toast(`已取消导入：完成 ${processed} 项，未导入 ${remain} 项`, 'success');
+        // 保留列表与勾选，方便直接再次导入剩余条目
+      } else {
+        // 完成态：进度条满格转绿并短暂停留，让用户明确看到导入完成
+        progBox.classList.add('done');
+        $('#phone-import-phase').textContent = '✓ 导入完成';
+        $('#phone-import-current').textContent = '';
+        $('#phone-import-fill').style.width = '100%';
+        $('#phone-import-sub').textContent = parts.join(' · ');
+        stateEl.innerHTML = `<span class="dot-on"></span>导入完成：${parts.join(' · ')}`;
+        toast(`手机导入完成：${parts.join(' · ')}`, (s.failed && s.failed.length) ? 'error' : 'success');
+        if (res.data.copy && res.data.copy.failed && res.data.copy.failed.length) {
+          toast(`${res.data.copy.failed.length} 个文件复制失败，已跳过`, 'error');
+        }
+        await new Promise((r) => setTimeout(r, 1400));
+        phoneGroups = [];
+        phonePicked = new Set();
+        $('#phone-modal').classList.add('hidden');
       }
-      phoneGroups = [];
-      phonePicked = new Set();
-      phoneBusy = false;
-      $('#phone-modal').classList.add('hidden');
     } catch (e) {
       off();
+      // 失败态：进度条转红并给出明确原因，弹窗保持打开便于重试
+      progBox.classList.add('error');
+      $('#phone-import-phase').textContent = '✕ 导入失败';
+      $('#phone-import-current').textContent = '';
+      $('#phone-import-sub').textContent = e.message || '请重试';
       stateEl.innerHTML = '<span class="dot-off"></span>导入失败';
       toast('从手机导入失败：' + e.message, 'error');
     } finally {
       phoneBusy = false;
+      phoneCancelPending = false;
       refresh.disabled = false;
       updatePhoneImportButton();
     }
@@ -2080,6 +2169,7 @@
     $('#wifi-toggle').onclick = () => (wifiOn ? stopWifiImport() : startWifiImport());
     $('#wifi-firewall').onclick = allowWifiFirewall;
     $('#phone-import-selected').onclick = importFromPhone;
+    $('#phone-cancel-import').onclick = requestPhoneCancel;
     $('#phone-select-all').onchange = (e) => {
       // 全选只勾选未导入的项，已导入的默认跳过（仍可手动勾选）
       phonePicked = e.target.checked ? new Set(phoneGroups.filter((g) => !g.imported).map((g) => g.id)) : new Set();

@@ -40,11 +40,12 @@ const MAX_IMPORT_FILES = 20000;
 // 导入并发度：独立文件互不依赖，适当并发可显著缩短总耗时
 const IMPORT_CONCURRENCY = 4;
 
-/** 简易并发池：按固定并发度执行任务，保持单个失败不影响其它任务 */
-async function runPool(items, limit, worker) {
+/** 简易并发池：按固定并发度执行任务，保持单个失败不影响其它任务；shouldStop 在取下一个任务前检查，已开始的任务照常完成 */
+async function runPool(items, limit, worker, shouldStop) {
   let next = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (next < items.length) {
+      if (shouldStop && shouldStop()) break;
       const index = next;
       next += 1;
       await worker(items[index], index);
@@ -270,12 +271,16 @@ class Library {
   }
 
   // ---------- 导入 ----------
-  async expandPaths(paths) {
+  async expandPaths(paths, options = {}) {
+    // 手机导入的暂存目录允许位于库内（同卷，入库时直接改名，不再产生第二份数据）
+    const stagingDir = options.stagingDir ? path.resolve(options.stagingDir) : null;
     const files = [];
     const seen = new Set();
     for (const p of paths || []) {
       const abs = path.resolve(p);
-      if (abs === this.root || isInside(this.root, abs)) continue;
+      const insideRoot = abs === this.root || isInside(this.root, abs);
+      const isStaging = Boolean(stagingDir && (abs === stagingDir || isInside(stagingDir, abs)));
+      if (insideRoot && !isStaging) continue;
       let st;
       try { st = await fsp.stat(abs); } catch { continue; }
       if (st.isDirectory()) {
@@ -297,6 +302,41 @@ class Library {
       if (files.length > MAX_IMPORT_FILES) break;
     }
     return files.slice(0, MAX_IMPORT_FILES);
+  }
+
+  /**
+   * 源文件是否已位于本库所在卷（例如手机导入的库内暂存目录）。
+   * 这种情况入库可以原地改名，不需要再写第二份数据。
+   */
+  isStagedSrc(src) {
+    const abs = path.resolve(src);
+    return abs === this.root || isInside(this.root, abs);
+  }
+
+  /**
+   * 入库写盘：源在本库内（同卷）时直接改名到目标位置，只读一遍源算 SHA-256 做无损校验，
+   * 全程不产生第二份数据；跨卷时回退为流式复制+哈希校验。
+   * 返回 { hash, size, adopted }。
+   */
+  async adoptVerified(src, dst) {
+    if (!this.isStagedSrc(src)) {
+      const copied = await copyVerified(src, dst);
+      return { ...copied, adopted: false };
+    }
+    const hash = await sha256File(src);
+    const st = await fsp.stat(src);
+    try {
+      await fsp.rename(src, dst);
+      return { hash, size: st.size, adopted: true };
+    } catch (e) {
+      // 少数同卷但被占用/权限受限的情况，退回复制并删除暂存件
+      if (e && ['EXDEV', 'EPERM', 'EACCES', 'EBUSY'].includes(e.code)) {
+        const copied = await copyVerified(src, dst);
+        await fsp.unlink(src).catch(() => {});
+        return { ...copied, adopted: false };
+      }
+      throw e;
+    }
   }
 
   newItem(patch) {
@@ -340,11 +380,12 @@ class Library {
     };
   }
 
-  async importPaths(paths, onProgress = () => {}) {
+  async importPaths(paths, onProgress = () => {}, options = {}) {
     this.assertAvailable();
-    const files = await this.expandPaths(paths);
+    const shouldStop = typeof options.shouldStop === 'function' ? options.shouldStop : null;
+    const files = await this.expandPaths(paths, options);
     if (!files.length) {
-      return { added: 0, skipped: 0, failed: [], live: 0, total: 0 };
+      return { added: 0, skipped: 0, failed: [], live: 0, total: 0, processed: 0, cancelled: false };
     }
 
     const imageFiles = [];
@@ -376,7 +417,7 @@ class Library {
 
     const total = tasks.length;
     let done = 0;
-    const summary = { added: 0, skipped: 0, failed: [], live: 0, total };
+    const summary = { added: 0, skipped: 0, failed: [], live: 0, total, processed: 0, cancelled: false };
     const bump = (current, item = null) => {
       done += 1;
       onProgress({
@@ -407,7 +448,12 @@ class Library {
         logLines.push(`失败: ${task.file} :: ${e.message}`);
         bump(task.file);
       }
-    });
+    }, shouldStop);
+
+    // 取消时：已开始的任务全部完成，未开始的任务不再执行
+    summary.processed = done;
+    summary.cancelled = Boolean(shouldStop && shouldStop());
+    if (summary.cancelled) logLines.push(`用户取消：已处理 ${done}/${total} 条，其余未导入`);
 
     await this.flush();
     if (logLines.length) {
@@ -428,7 +474,7 @@ class Library {
     const destDir = path.join(this.root, toNative(DIRS.originals), y, m);
     await ensureDir(destDir);
     const dest = await this.reserveDest(destDir, path.basename(src));
-    const copied = await copyVerified(src, dest);
+    const copied = await this.adoptVerified(src, dest);
 
     if (this._hashMap.has(copied.hash) || this._pendingHashes.has(copied.hash)) {
       await fsp.unlink(dest).catch(() => {});
@@ -470,7 +516,7 @@ class Library {
           await ensureDir(liveDir);
           const stem = stemOf(item.name);
           const videoDest = await this.reserveDest(liveDir, `${stem}${vExt}`);
-          await copyVerified(pairedVideo, videoDest);
+          await this.adoptVerified(pairedVideo, videoDest);
           const probe = await probeVideo(videoDest);
           item.type = 'live';
           item.motionRel = this.rel(videoDest);
@@ -504,6 +550,15 @@ class Library {
             item.motionDuration = extracted.duration || 0;
             item.updatedAt = now();
             this._relMap.set(item.motionRel.toLowerCase(), item);
+          } else if (extracted.detected) {
+            // 已确认内嵌动态段但解码器不支持：按「实况（待支持）」归类，避免误判为静态图
+            item.type = 'live';
+            item.motionRel = this.rel(candidate);
+            item.motionKind = extracted.kind;
+            item.motionStatus = 'unsupported';
+            item.updatedAt = now();
+            this._relMap.set(item.motionRel.toLowerCase(), item);
+            liveUnsupported = true;
           } else {
             await fsp.unlink(candidate).catch(() => {});
             this._reserved.delete(candidate.toLowerCase());
@@ -527,7 +582,7 @@ class Library {
     const destDir = path.join(this.root, toNative(DIRS.videos), y, m);
     await ensureDir(destDir);
     const dest = await this.reserveDest(destDir, path.basename(src));
-    const copied = await copyVerified(src, dest);
+    const copied = await this.adoptVerified(src, dest);
 
     if (this._hashMap.has(copied.hash) || this._pendingHashes.has(copied.hash)) {
       await fsp.unlink(dest).catch(() => {});

@@ -6,8 +6,10 @@
  * 手机在 Windows 上以「可移植设备」出现，没有盘符，Node 的 fs 无法直接读取，
  * 因此这里通过 PowerShell 的 Shell.Application COM 接口：
  *   1. 枚举手机 DCIM 目录下的照片 / 视频，并把同主名的图片 + 视频合并为一个「实况」条目；
- *   2. 把用户选中的文件通过 Shell 的 CopyHere 复制到本地暂存目录，之后再走既有导入管道。
- * 暂存目录仅用于中转，导入完成即删除，用户看不到也不需要关心。
+ *   2. 把用户选中的文件通过 Shell 的 CopyHere 复制到调用方给定的暂存目录
+ *      （现为照片库根内的 .photo-repo/phone-incoming，与目标存储同卷，
+ *       入库时直接改名就位，不产生第二份数据，也不占用系统盘）。
+ * 复制过程完全静默：不弹系统「正在复制…」对话框，进度由 Write-CopyProgress 回报。
  */
 
 const fs = require('fs');
@@ -154,9 +156,28 @@ $json = $result | ConvertTo-Json -Depth 6 -Compress
 `;
 
 // 把选中的文件从手机复制到暂存目录
-const PS_COPY = 'param([string]$Out, [string]$Dest, [string]$Plan)\n' + PS_HELPERS + String.raw`
+const PS_COPY = 'param([string]$Out, [string]$Dest, [string]$Plan, [string]$Progress, [string]$Cancel)\n' + PS_HELPERS + String.raw`
 $ErrorActionPreference = 'Stop'
-$result = @{ ok = $false; copied = @(); failed = @(); error = '' }
+$result = @{ ok = $false; copied = @(); failed = @(); error = ''; cancelled = $false }
+
+# 复制进度：每完成一个文件（或等待落地期间按字节）增量写 JSON 到 $Progress，Node 侧轮询转发给前端
+$progTotal = 0
+$progDone = 0
+$progItems = 0
+$progItemDone = 0
+$progFile = ''
+$progLast = [DateTime]::MinValue
+function Write-CopyProgress([int64]$fileDone, [int64]$fileTotal, [bool]$force) {
+  if (-not $Progress) { return }
+  $now = Get-Date
+  if (-not $force -and ($now - $progLast).TotalMilliseconds -lt 250) { return }
+  $script:progLast = $now
+  $obj = [pscustomobject]@{ phase = 'copy'; done = $progDone; total = $progTotal; itemDone = $progItemDone; itemTotal = $progItems; current = $progFile; fileDone = $fileDone; fileTotal = $fileTotal }
+  try {
+    $json = $obj | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($Progress, $json, (New-Object System.Text.UTF8Encoding($false)))
+  } catch {}
+}
 
 # 等待异步复制落地：文件出现后按体积判断完成；长时间无增长视为结束，避免无限等待
 function Wait-Copy([string]$Target, [int64]$Expected) {
@@ -174,6 +195,7 @@ function Wait-Copy([string]$Target, [int64]$Expected) {
     $now = Get-Date
     if ($has) {
       $started = $true
+      Write-CopyProgress $len $Expected $false
       if ($Expected -gt 0 -and $len -ge $Expected) { return 'OK' }
       if ($Expected -le 0 -and $len -gt 0) { return 'OK' }
       if ($len -ne $lastLen) { $lastLen = $len; $lastChange = $now }
@@ -298,6 +320,16 @@ public static class PhoneCopy
 "@
   $mediaPlan = Get-Content -Raw -Path $Plan -Encoding UTF8 | ConvertFrom-Json
   if ($mediaPlan -isnot [array]) { $mediaPlan = @($mediaPlan) }
+  # 计划按「条目」分组：实况照片的图片 + 视频同属一组，取消只在条目边界生效
+  $groups = @()
+  foreach ($g in $mediaPlan) {
+    if ($g -is [array]) { $groups += ,@($g | ForEach-Object { [string]$_ }) }
+    else { $groups += ,@([string]$g) }
+  }
+  $progTotal = 0
+  foreach ($g in $groups) { $progTotal += $g.Count }
+  $progItems = $groups.Count
+  Write-CopyProgress 0 0 $true
   $found = Find-Dcim
   if (-not $found) {
     $result.error = 'NO_DEVICE'
@@ -350,68 +382,86 @@ public static class PhoneCopy
       return $null
     }
 
-    foreach ($rawRel in $mediaPlan) {
-      $rel = [string]$rawRel
-      if (-not $rel) { continue }
-      $parts = @($rel -split '/')
-      $fileName = $parts[$parts.Count - 1]
-      $dirRel = if ($parts.Count -gt 1) { $parts[0] } else { '' }
-      $destDir = if ($dirRel) { Join-Path $Dest $dirRel } else { $Dest }
-      New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-      $target = Join-Path $destDir $fileName
+    foreach ($group in $groups) {
+      # 取消只在「条目」边界生效：已开始的条目继续复制完，未开始的条目立即截止
+      if ($Cancel -and (Test-Path -LiteralPath $Cancel)) { $result.cancelled = $true; break }
+      $groupOk = $true
+      foreach ($rawRel in $group) {
+        $rel = [string]$rawRel
+        if (-not $rel) { continue }
+        $parts = @($rel -split '/')
+        $fileName = $parts[$parts.Count - 1]
+        $progFile = $fileName
+        $dirRel = if ($parts.Count -gt 1) { $parts[0] } else { '' }
+        $destDir = if ($dirRel) { Join-Path $Dest $dirRel } else { $Dest }
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        $target = Join-Path $destDir $fileName
 
-      $item = Resolve-PhoneItem $rel
-      if (-not $item) {
-        $result.failed += [pscustomobject]@{ rel = $rel; error = 'NOT_FOUND' }
-        if ($result.copied.Count -eq 0 -and $result.failed.Count -ge 3) { $result.error = 'COPY_BLOCKED'; break }
-        continue
-      }
-
-      $expected = [int64]0
-      try { if ($item.Size) { $expected = [int64]$item.Size } } catch {}
-      if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
-
-      # 策略一：Shell 命名空间 CopyHere（静默，复制过程靠 Wait-Copy 泵消息）
-      try {
-        $destNS = $shell.NameSpace($destDir)
-        if ($destNS) { $destNS.CopyHere($item, 532) }
-      } catch {}
-      $state = Wait-Copy $target $expected
-
-      # 策略二：IFileOperation 同步复制（CopyHere 不落地时使用）
-      if ($state -ne 'OK') {
-        try { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } } catch {}
-        try { [PhoneCopy]::Copy($item, $destDir, $fileName) | Out-Null } catch {}
-        $state = Wait-Copy $target $expected
-      }
-
-      $done = ($state -eq 'OK')
-      if (-not $done -and (Test-Path -LiteralPath $target)) {
-        # 设备端可能改写了文件名：按主文件名找回刚复制好的文件
-        try {
-          $stem = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-          $cand = Get-ChildItem -LiteralPath $destDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne $fileName -and $_.BaseName.StartsWith($stem) } |
-            Select-Object -First 1
-          if ($cand -and ($expected -le 0 -or $cand.Length -ge $expected)) {
-            Move-Item -LiteralPath $cand.FullName -Destination $target -Force
-            $done = $true
-          }
-        } catch {}
-      }
-
-      if ($done) {
-        $result.copied += $rel
-      } else {
-        try { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } } catch {}
-        $err = if ($state -eq 'PARTIAL') { 'COPY_INCOMPLETE' } else { 'COPY_TIMEOUT' }
-        $result.failed += [pscustomobject]@{ rel = $rel; error = $err }
-        # 一个都复制不出来时直接中止，避免逐个等待拖到超时
-        if ($result.copied.Count -eq 0 -and $result.failed.Count -ge 3) {
-          $result.error = 'COPY_BLOCKED'
-          break
+        $item = Resolve-PhoneItem $rel
+        if (-not $item) {
+          $groupOk = $false
+          $result.failed += [pscustomobject]@{ rel = $rel; error = 'NOT_FOUND' }
+          $progDone += 1
+          Write-CopyProgress 0 0 $true
+          if ($result.copied.Count -eq 0 -and $result.failed.Count -ge 3) { $result.error = 'COPY_BLOCKED'; break }
+          continue
         }
+
+        $expected = [int64]0
+        try { if ($item.Size) { $expected = [int64]$item.Size } } catch {}
+        Write-CopyProgress 0 $expected $true
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+
+        # 策略一：Shell 命名空间 CopyHere（完全静默，复制过程靠 Wait-Copy 泵消息）
+        # 1556 = FOF_SILENT(0x4) | FOF_NOCONFIRMATION(0x10) | FOF_NOCONFIRMMKDIR(0x200) | FOF_NOERRORUI(0x400)
+        # 缺 FOF_NOERRORUI 时设备端异常会弹出系统「正在复制…」/错误对话框
+        try {
+          $destNS = $shell.NameSpace($destDir)
+          if ($destNS) { $destNS.CopyHere($item, 1556) }
+        } catch {}
+        $state = Wait-Copy $target $expected
+
+        # 策略二：IFileOperation 同步复制（CopyHere 不落地时使用）
+        if ($state -ne 'OK') {
+          try { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } } catch {}
+          try { [PhoneCopy]::Copy($item, $destDir, $fileName) | Out-Null } catch {}
+          $state = Wait-Copy $target $expected
+        }
+
+        $done = ($state -eq 'OK')
+        if (-not $done -and (Test-Path -LiteralPath $target)) {
+          # 设备端可能改写了文件名：按主文件名找回刚复制好的文件
+          try {
+            $stem = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+            $cand = Get-ChildItem -LiteralPath $destDir -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne $fileName -and $_.BaseName.StartsWith($stem) } |
+              Select-Object -First 1
+            if ($cand -and ($expected -le 0 -or $cand.Length -ge $expected)) {
+              Move-Item -LiteralPath $cand.FullName -Destination $target -Force
+              $done = $true
+            }
+          } catch {}
+        }
+
+        if ($done) {
+          $result.copied += $rel
+        } else {
+          $groupOk = $false
+          try { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } } catch {}
+          $err = if ($state -eq 'PARTIAL') { 'COPY_INCOMPLETE' } else { 'COPY_TIMEOUT' }
+          $result.failed += [pscustomobject]@{ rel = $rel; error = $err }
+          # 一个都复制不出来时直接中止，避免逐个等待拖到超时
+          if ($result.copied.Count -eq 0 -and $result.failed.Count -ge 3) {
+            $result.error = 'COPY_BLOCKED'
+            break
+          }
+        }
+        $progDone += 1
+        Write-CopyProgress 0 0 $true
       }
+      if ($groupOk) { $progItemDone += 1 }
+      Write-CopyProgress 0 0 $true
+      if ($result.error -eq 'COPY_BLOCKED') { break }
     }
     $result.ok = ($result.failed.Count -eq 0)
   }
@@ -682,25 +732,48 @@ async function listPhoneMedia() {
   }
 }
 
-/** 把手机上的相对路径文件复制到本地暂存目录 */
-async function copyPhoneFiles(rels, destDir) {
+/**
+ * 把手机上的相对路径文件复制到本地暂存目录。
+ * items 支持两种形态：string[]（每个文件独立）或 string[][]（按条目分组，实况的图片+视频同组）。
+ * 传入 cancelPath 时，取消标记一旦出现，会在「条目」边界截止：已开始的条目复制完，未开始的条目不再复制。
+ */
+async function copyPhoneFiles(items, destDir, onProgress, opts = {}) {
   const outPath = tempPath('json');
   const planPath = tempPath('json');
-  fs.writeFileSync(planPath, JSON.stringify(rels), 'utf8');
+  const progPath = typeof onProgress === 'function' ? tempPath('json') : '';
+  const cancelPath = opts.cancelPath || '';
+  fs.writeFileSync(planPath, JSON.stringify(items), 'utf8');
+  const args = ['-Out', outPath, '-Dest', destDir, '-Plan', planPath];
+  if (progPath) args.push('-Progress', progPath);
+  if (cancelPath) args.push('-Cancel', cancelPath);
+  let progTimer = null;
   try {
-    await runPowerShell(PS_COPY, ['-Out', outPath, '-Dest', destDir, '-Plan', planPath], 60 * 60 * 1000);
+    if (progPath) {
+      let lastRaw = '';
+      progTimer = setInterval(() => {
+        let raw = '';
+        try { raw = fs.readFileSync(progPath, 'utf8'); } catch { return; }
+        if (!raw || raw === lastRaw) return;
+        lastRaw = raw;
+        try { onProgress(JSON.parse(raw.replace(/^\uFEFF/, ''))); } catch {}
+      }, 200);
+    }
+    await runPowerShell(PS_COPY, args, 60 * 60 * 1000);
     const data = await readResult(outPath);
     return {
       ok: Boolean(data.ok),
+      cancelled: Boolean(data.cancelled),
       copied: Array.isArray(data.copied) ? data.copied : (data.copied ? [data.copied] : []),
       failed: Array.isArray(data.failed) ? data.failed : (data.failed ? [data.failed] : []),
       error: data.error || '',
     };
   } catch (e) {
-    return { ok: false, copied: [], failed: [], error: e.killed ? 'TIMEOUT' : (e.message || 'COPY_FAILED') };
+    return { ok: false, cancelled: false, copied: [], failed: [], error: e.killed ? 'TIMEOUT' : (e.message || 'COPY_FAILED') };
   } finally {
+    if (progTimer) clearInterval(progTimer);
     try { fs.unlinkSync(outPath); } catch {}
     try { fs.unlinkSync(planPath); } catch {}
+    if (progPath) { try { fs.unlinkSync(progPath); } catch {} }
   }
 }
 

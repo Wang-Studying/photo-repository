@@ -11,6 +11,7 @@ const CHANNELS = new Set([
   'phone-thumb',
   'phone-thumb-status',
   'phone-thumb-done',
+  'phone-import-progress',
   'phone-wifi-progress',
   'similar-progress',
 ]);
@@ -54,7 +55,8 @@ contextBridge.exposeInMainWorld('api', {
     detect: () => invoke('phone:detect'),
     list: () => invoke('phone:list'),
     thumbs: (groups) => invoke('phone:thumbs', groups),
-    importSelected: (rels) => invoke('phone:import', rels),
+    importSelected: (groups) => invoke('phone:import', groups),
+    cancelImport: () => invoke('phone:cancel'),
     wifiStart: (ip) => invoke('phone-wifi:start', ip),
     wifiStop: () => invoke('phone-wifi:stop'),
     wifiFirewall: () => invoke('phone-wifi:allow-firewall'),

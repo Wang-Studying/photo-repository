@@ -15,6 +15,11 @@ const { PhoneServer, PORT_RANGE, FIREWALL_RULE } = require('./lib/phone-server')
 const QRCode = require('qrcode');
 const media = require('./lib/media');
 const { formatBytes, stemOf } = require('./lib/util');
+const appPaths = require('./lib/app-paths');
+
+// 必须在 ready 之前重定向：Chromium 的缓存/会话会先在 userData 下创建。
+// 数据目录改为用户自定义路径（安装目录下的 photo-repo-data），不再写 %APPDATA%\照片仓库。
+const appData = appPaths.prepare(app);
 
 let win = null;
 let config = null;
@@ -205,6 +210,20 @@ async function locateLibrary(libraryId) {
 // 手机相册封面任务：按目录轮询已生成的封面，生成一张就推送一张
 let thumbToken = 0;
 
+// 手机导入取消：一次导入一个取消标记，复制阶段靠磁盘标记文件跨进程通知 PowerShell
+const phoneCancel = { requested: false, flagPath: '', atPhase: 'copy' };
+// 当前导入所处阶段：copy（手机→暂存）/ import（暂存→库）
+let phoneImportPhase = 'copy';
+
+/** 前端可传 string[]（文件）或 string[][]（按条目分组）；统一成「条目 → 文件」分组，取消以条目为单位 */
+function normalizePhoneGroups(payload) {
+  if (!Array.isArray(payload)) return [];
+  const groups = payload
+    .map((g) => (Array.isArray(g) ? g.map((r) => String(r)).filter(Boolean) : (g ? [String(g)] : [])))
+    .filter((g) => g.length);
+  return groups;
+}
+
 /**
  * Shell 缩略图拿不到时的本地兜底：把待生成封面的图片先复制到本地，
  * 再用项目既有的 media 能力生成封面（图片走 buildThumb，视频走 buildCover）。
@@ -270,7 +289,10 @@ async function startThumbJob(groups, token) {
     .filter((g) => g && typeof g.id === 'string' && Array.isArray(g.files) && g.files.length);
   if (!list.length) return;
 
-  const baseDir = path.join(app.getPath('userData'), 'phone-thumbs');
+  // 手机封面放库内 .photo-repo（可随时重建），不写安装目录、也不写系统盘
+  const baseDir = library
+    ? path.join(library.root, '.photo-repo', 'phone-thumbs')
+    : path.join(app.getPath('userData'), 'phone-thumbs');
   await fsp.rm(baseDir, { recursive: true, force: true });
   const dir = path.join(baseDir, String(token));
   await fsp.mkdir(dir, { recursive: true });
@@ -637,13 +659,14 @@ function registerIpc() {
   handle('phone-wifi:start', async (ip) => {
     const lib = requireLibrary();
     if (!phoneServer) phoneServer = new PhoneServer();
-    const staging = path.join(app.getPath('userData'), 'wifi-upload');
+    // WiFi 上传同样落库内暂存（同卷直接改名入库，不占用系统盘）
+    const staging = path.join(lib.root, '.photo-repo', 'wifi-upload');
     const info = await phoneServer.start({
       stagingDir: staging,
       ip: ip || null,
       onProgress: (p) => send('phone-wifi-progress', p),
       onFile: async (absPath, name) => {
-        const summary = await lib.importPaths([absPath], () => {});
+        const summary = await lib.importPaths([absPath], () => {}, { stagingDir: staging });
         if (summary.added > 0) {
           send('library-changed', buildState());
           return 'imported';
@@ -730,24 +753,52 @@ function registerIpc() {
     return { started: true };
   });
 
-  handle('phone:import', async (rels) => {
-    if (!Array.isArray(rels) || !rels.length) {
+  handle('phone:cancel', async () => {
+    // 只置标记，不打断已开始条目的复制/入库；未开始的条目会在下一个边界截止。
+    // 记录取消发生在哪个阶段：复制阶段取消 = 已复制完成的条目仍要入库保留；
+    // 入库阶段取消 = 未开始入库的条目才截止。
+    phoneCancel.atPhase = phoneImportPhase;
+    phoneCancel.requested = true;
+    if (phoneCancel.flagPath) {
+      try { await fsp.writeFile(phoneCancel.flagPath, '1', 'utf8'); } catch {}
+    }
+    return { requested: true };
+  });
+
+  handle('phone:import', async (payload) => {
+    const groups = normalizePhoneGroups(payload);
+    if (!groups.length) {
       const e = new Error('未选择任何文件');
       e.code = 'EMPTY_SELECTION';
       throw e;
     }
+    const rels = groups.reduce((acc, g) => acc.concat(g), []);
     const lib = requireLibrary();
-    let staging = path.join(app.getPath('userData'), 'phone-cache');
+    // 取消状态在导入开始时重置，且早于任何耗时操作，避免用户抢先点击「取消导入」时丢失
+    phoneCancel.requested = false;
+    phoneCancel.atPhase = 'copy';
+    phoneImportPhase = 'copy';
+    phoneCancel.flagPath = path.join(lib.root, '.photo-repo', 'phone-cancel.flag');
+    try { await fsp.rm(phoneCancel.flagPath, { force: true }); } catch {}
+    // 暂存目录放在库内：手机文件直接落到目标存储位置所在卷，
+    // 入库时同卷 rename 就位，不再经过 AppData，也不再产生第二份数据
+    const staging = path.join(lib.root, '.photo-repo', 'phone-incoming');
     try {
       await fsp.rm(staging, { recursive: true, force: true });
     } catch {
-      // 上次暂存里若有被占用的文件（旧版本解码句柄未释放）会删不掉，换全新目录，不阻塞导入
-      staging = path.join(app.getPath('userData'), `phone-cache-${Date.now()}`);
+      // 上次暂存里若有被占用的文件（旧版本解码句柄未释放）会删不掉，跳过即可，入库会覆盖同名之外的部分
+      console.warn('[phone-import] 暂存目录清理未完成，继续导入');
     }
     await fsp.mkdir(staging, { recursive: true });
     try {
-      const copy = await copyPhoneFiles(rels, staging);
+      const copy = await copyPhoneFiles(groups, staging, (p) => {
+        send('phone-import-progress', { phase: 'copy', done: p.done || 0, total: p.total || rels.length, itemDone: p.itemDone || 0, itemTotal: p.itemTotal || groups.length, current: p.current || '', fileDone: p.fileDone || 0, fileTotal: p.fileTotal || 0 });
+      }, { cancelPath: phoneCancel.flagPath });
       if (!copy.copied.length) {
+        // 用户在复制第一条之前就取消：没有已开始的条目，直接按取消返回
+        if (phoneCancel.requested) {
+          return { summary: { added: 0, skipped: 0, failed: [], live: 0, total: 0, processed: 0, cancelled: true }, copy, cancelled: true };
+        }
         const code = copy.error || 'COPY_FAILED';
         let msg = copy.error || '';
         if (code === 'NO_DEVICE') msg = '手机已断开连接，请重新连接后点击「重新检测」';
@@ -763,23 +814,76 @@ function registerIpc() {
         e.code = code;
         throw e;
       }
-      const summary = await lib.importPaths([staging], (p) => send('import-progress', p));
+
+      // 复制阶段按下取消：已复制完成的条目按“已完成”处理，继续入库保留，
+      // 只是不再接手新的条目；入库阶段再按取消则截止后续未开始入库的条目。
+      if (phoneCancel.requested && phoneCancel.atPhase !== 'import') {
+        phoneCancel.requested = false;
+        try { await fsp.rm(phoneCancel.flagPath, { force: true }); } catch {}
+      }
+      phoneImportPhase = 'import';
+      const summary = await lib.importPaths([staging], (p) => {
+        send('import-progress', p);
+        send('phone-import-progress', { phase: 'import', done: p.done || 0, total: p.total || 0, current: p.current || '', added: p.added || 0, skipped: p.skipped || 0 });
+      }, { shouldStop: () => phoneCancel.requested, stagingDir: staging });
       await lib.flush();
       lib.reindexMaps();
       send('library-changed', buildState());
-      if (!summary.added && !summary.skipped) {
+      const cancelled = Boolean(copy.cancelled || summary.cancelled);
+      // 取消时允许「0 新增」：把已复制但未入库的剩余条目报为未导入，而不是当失败
+      if (!cancelled && !summary.added && !summary.skipped) {
         const e = new Error('文件已复制到本机但入库失败，请重试');
         e.code = 'IMPORT_FAILED';
         throw e;
       }
-      return { summary, copy };
+      return { summary, copy, cancelled, selected: groups.length };
     } finally {
       fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
+      try { await fsp.rm(phoneCancel.flagPath, { force: true }); } catch {}
     }
   });
 }
 
+/** 清理旧版本遗留在 AppData 的手机导入中转目录（新版直接写入库内暂存，不再占用系统盘） */
+async function cleanLegacyPhoneCache() {
+  const userData = app.getPath('userData');
+  let names = [];
+  try { names = await fsp.readdir(userData); } catch { return; }
+  for (const name of names) {
+    if (!/^phone-cache(?:-\d+)?$/.test(name)) continue;
+    try {
+      await fsp.rm(path.join(userData, name), { recursive: true, force: true });
+      console.log(`已清理旧的手机导入中转目录：${name}`);
+    } catch (e) {
+      console.warn(`旧中转目录清理失败（可手动删除）：${name}`, e.message);
+    }
+  }
+}
+
+/**
+ * 把旧版写在系统盘的配置迁移到新的数据目录，确认新配置写入成功后再删除旧目录。
+ * 照片库本身在用户自选路径，不在此次搬迁范围内，这里只搬 config.json。
+ */
+async function migrateLegacyAppData() {
+  if (!appData.moved) return;
+  try {
+    const r = await appPaths.migrateLegacyData(appData.legacyDir, appData.dataDir);
+    if (r.migrated) console.log('已迁移配置到：', path.join(appData.dataDir, 'config.json'));
+    if (r.removed) console.log('已删除旧的系统盘数据目录：', appData.legacyDir);
+    if (r.kept) console.warn('配置迁移未完成，保留旧目录：', appData.legacyDir);
+  } catch (e) {
+    console.warn(`旧数据目录清理失败（可稍后手动删除）：${appData.legacyDir}`, e.message);
+  }
+}
+
 async function bootstrap() {
+  await migrateLegacyAppData();
+  console.log(`应用数据目录：${appData.dataDir}`);
+  if (appData.fallback === 'system') {
+    console.warn('安装目录不可写，应用数据暂存系统默认位置；请把程序安装到可写路径');
+  } else if (appData.fallback === 'library') {
+    console.warn(`安装目录不可写，应用数据放在照片库内：${appData.dataDir}`);
+  }
   config = new Config(app.getPath('userData'));
   mediaServer = await new MediaServer().start();
   registerIpc();
@@ -787,6 +891,8 @@ async function bootstrap() {
   nativeTheme.themeSource = 'dark';
   Menu.setApplicationMenu(null);
   createWindow();
+
+  cleanLegacyPhoneCache().catch(() => {});
 
   const savedRoot = config.all.storageRoot;
   if (savedRoot && fs.existsSync(savedRoot)) {

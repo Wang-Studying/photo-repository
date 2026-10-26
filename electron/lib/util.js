@@ -76,20 +76,35 @@ async function sha256File(file) {
 }
 
 /**
- * 字节级原样复制：用 fs.copyFile 走系统复制，再对目标文件计算 SHA-256，原子改名。
- * 传入 expectedHash 时会校验目标与期望一致。返回 { hash, size }，失败不留下半成品。
+ * 字节级原样复制：流式复制的同时顺带算出 SHA-256（单遍读源文件，省去复制后再整读一遍）。
+ * 传入 expectedHash 时仍会再读一次落盘件做严格校验（用于迁移等要求验证写结果的场景）。
+ * 返回 { hash, size }，失败不留下半成品。
  */
 async function copyVerified(src, dst, expectedHash = null) {
   const tmp = `${dst}.part-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
-    await fsp.copyFile(src, tmp);
-    const dstHash = await sha256File(tmp);
-    if (expectedHash && dstHash !== expectedHash) {
-      throw new Error('字节校验失败：复制前后不一致');
+    const hash = crypto.createHash('sha256');
+    await new Promise((resolve, reject) => {
+      const rs = fs.createReadStream(src);
+      const ws = fs.createWriteStream(tmp);
+      rs.on('data', (c) => hash.update(c));
+      rs.on('error', reject);
+      ws.on('error', reject);
+      // 等 close（而非 finish）：确保 Windows 上句柄已释放，rename 不会 EPERM/EBUSY
+      ws.on('close', resolve);
+      rs.pipe(ws);
+    });
+    const srcHash = hash.digest('hex');
+    if (expectedHash) {
+      // 严格校验模式：确认落盘字节与期望一致（读 tmp，而非信任流式写）
+      const dstHash = await sha256File(tmp);
+      if (dstHash !== expectedHash) {
+        throw new Error('字节校验失败：复制前后不一致');
+      }
     }
     const st = await fsp.stat(tmp);
     await fsp.rename(tmp, dst);
-    return { hash: dstHash, size: st.size };
+    return { hash: srcHash, size: st.size };
   } catch (e) {
     await fsp.unlink(tmp).catch(() => {});
     throw e;

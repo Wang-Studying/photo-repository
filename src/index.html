@@ -220,44 +220,53 @@
         <button id="phone-close" class="icon-btn">✕</button>
       </header>
 
-      <section class="phone-section" id="section-wired">
-        <div class="phone-detect-state" id="phone-detect-state">正在检测设备…</div>
-        <div class="phone-toolbar hidden" id="phone-toolbar">
-          <label class="phone-check"><input type="checkbox" id="phone-select-all" /> 全选</label>
-          <span class="muted" id="phone-summary"></span>
-        </div>
-        <div class="phone-media-list hidden" id="phone-media-list"></div>
-        <div class="phone-note hidden" id="phone-detect-tip">
-          检测不到？请用数据线连接手机：iPhone 需解锁并点「信任此电脑」，Android 选择「文件传输（MTP）」模式。接好后点下方「重新检测」。
-        </div>
-        <div class="phone-import-row">
-          <button id="phone-refresh" class="ghost">重新检测</button>
-          <div class="spacer"></div>
-          <button id="phone-import-selected" class="primary" disabled>导入所选</button>
-        </div>
-      </section>
+      <div class="phone-body">
+        <section class="phone-section" id="section-wired">
+          <div class="phone-detect-state" id="phone-detect-state">正在检测设备…</div>
+          <div class="phone-toolbar hidden" id="phone-toolbar">
+            <label class="phone-check"><input type="checkbox" id="phone-select-all" /> 全选</label>
+            <span class="muted" id="phone-summary"></span>
+          </div>
+          <div id="phone-import-progress" class="phone-import-progress hidden">
+            <div class="import-progress-head"><span id="phone-import-phase">正在导入</span><span class="import-current" id="phone-import-current"></span></div>
+            <div class="import-progress-track"><div class="import-progress-fill" id="phone-import-fill"></div></div>
+            <div class="import-progress-sub" id="phone-import-sub"></div>
+          </div>
+          <div class="phone-media-list hidden" id="phone-media-list"></div>
+          <div class="phone-note hidden" id="phone-detect-tip">
+            检测不到？请用数据线连接手机：iPhone 需解锁并点「信任此电脑」，Android 选择「文件传输（MTP）」模式。接好后点下方「重新检测」。
+          </div>
+        </section>
 
-      <section class="phone-section" id="section-wifi">
-        <div class="phone-wifi-head">
-          <div class="phone-wifi-title">免数据线 · WiFi 导入</div>
-          <button id="wifi-toggle" class="ghost">开启</button>
-        </div>
-        <div id="wifi-panel" class="hidden">
-          <div class="wifi-body">
-            <img id="wifi-qr" alt="扫码打开上传页" />
-            <div class="wifi-side">
-              <div class="wifi-url" id="wifi-url">—</div>
-              <div class="wifi-hint">手机与电脑连同一 WiFi，扫码后在手机浏览器里选择照片 / 视频上传，收到即自动入库（重复文件自动跳过）。</div>
-              <select id="wifi-ip" class="wifi-ip hidden" title="选择用于扫码的网卡地址"></select>
-              <div class="wifi-tips">
-                <button id="wifi-firewall" class="ghost wifi-fix">页面打不开？放行防火墙</button>
-                <span class="wifi-tip-text">需在弹出的授权框中点「是」</span>
+        <section class="phone-section" id="section-wifi">
+          <div class="phone-wifi-head">
+            <div class="phone-wifi-title">免数据线 · WiFi 导入</div>
+            <button id="wifi-toggle" class="ghost">开启</button>
+          </div>
+          <div id="wifi-panel" class="hidden">
+            <div class="wifi-body">
+              <img id="wifi-qr" alt="扫码打开上传页" />
+              <div class="wifi-side">
+                <div class="wifi-url" id="wifi-url">—</div>
+                <div class="wifi-hint">手机与电脑连同一 WiFi，扫码后在手机浏览器里选择照片 / 视频上传，收到即自动入库（重复文件自动跳过）。</div>
+                <select id="wifi-ip" class="wifi-ip hidden" title="选择用于扫码的网卡地址"></select>
+                <div class="wifi-tips">
+                  <button id="wifi-firewall" class="ghost wifi-fix">页面打不开？放行防火墙</button>
+                  <span class="wifi-tip-text">需在弹出的授权框中点「是」</span>
+                </div>
               </div>
             </div>
+            <div id="wifi-log" class="wifi-log"></div>
           </div>
-          <div id="wifi-log" class="wifi-log"></div>
-        </div>
-      </section>
+        </section>
+      </div>
+
+      <footer class="phone-foot">
+        <button id="phone-refresh" class="ghost">重新检测</button>
+        <div class="spacer"></div>
+        <button id="phone-cancel-import" class="ghost hidden">取消导入</button>
+        <button id="phone-import-selected" class="primary" disabled>导入所选</button>
+      </footer>
     </div>
   </div>
 

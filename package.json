@@ -1,7 +1,7 @@
 {
   "name": "photo-repository",
   "productName": "照片仓库",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Windows 桌面照片仓库：相册式浏览、动态照片悬停播放、非破坏裁剪、像素保真、存储根可迁移",
   "main": "electron/main.js",
   "author": "PhotoRepository",
