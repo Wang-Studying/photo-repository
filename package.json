@@ -1,0 +1,59 @@
+{
+  "name": "photo-repository",
+  "productName": "照片仓库",
+  "version": "1.0.0",
+  "description": "Windows 桌面照片仓库：相册式浏览、动态照片悬停播放、非破坏裁剪、像素保真、存储根可迁移",
+  "main": "electron/main.js",
+  "author": "PhotoRepository",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64",
+    "pack": "electron-builder --win --x64 --dir"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "exifr": "^7.1.3",
+    "heic-decode": "^2.1.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "electron": "^32.2.7",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.photorepo.desktop",
+    "productName": "PhotoRepository",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@ffmpeg-installer/**",
+      "node_modules/sharp/**",
+      "node_modules/@img/**",
+      "node_modules/libheif-js/**"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "artifactName": "PhotoRepository-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "PhotoRepository-Portable-${version}-${arch}.${ext}"
+    }
+  }
+}

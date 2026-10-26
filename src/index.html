@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' data: blob: http://127.0.0.1:*; media-src 'self' blob: http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self';" />
+  <title>照片仓库</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="shell">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="logo"><span></span></div>
+        <div class="brand-text">
+          <div class="brand-title">照片仓库</div>
+          <div class="brand-sub" id="storage-path">未连接存储</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-nav="timeline"><span class="nav-dot"></span><span class="nav-label">图库</span><em id="count-all">0</em></button>
+        <button class="nav-item" data-nav="favorites"><span class="nav-dot"></span><span class="nav-label">收藏</span><em id="count-fav">0</em></button>
+        <button class="nav-item" data-nav="trash"><span class="nav-dot"></span><span class="nav-label">回收站</span><em id="count-trash">0</em></button>
+      </nav>
+
+      <div class="side-section">
+        <div class="side-head">
+          <span>相册</span>
+          <button class="mini" id="btn-new-album" title="新建相册">＋</button>
+        </div>
+        <div id="album-list" class="side-list"></div>
+      </div>
+
+      <div class="side-section tags">
+        <div class="side-head"><span>标签</span></div>
+        <div id="tag-list" class="tag-cloud"></div>
+      </div>
+
+      <div class="side-footer">
+        <button id="btn-settings" class="ghost wide">设置</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <div class="title-wrap">
+          <h1 id="view-title">图库</h1>
+          <div id="view-sub" class="sub">还没有照片</div>
+        </div>
+
+        <div class="chips" id="media-chips">
+          <button data-media="all" class="chip active">全部</button>
+          <button data-media="image" class="chip">照片</button>
+          <button data-media="video" class="chip">视频</button>
+          <button data-media="live" class="chip">实况</button>
+        </div>
+
+        <div class="search">
+          <input id="search" type="search" placeholder="搜索名称 / 标签 / 相册" spellcheck="false" />
+        </div>
+
+        <div class="toolbar">
+          <button id="btn-import" class="primary">导入</button>
+          <button id="btn-import-folder" class="ghost">导入文件夹</button>
+          <button id="btn-phone" class="ghost">📱 从手机导入</button>
+        </div>
+      </header>
+
+      <div id="selection-bar" class="hidden">
+        <span id="sel-count">已选择 0 项</span>
+        <div class="sel-actions">
+          <button data-sel="album">加入相册</button>
+          <button data-sel="tags">添加标签</button>
+          <button data-sel="fav">收藏</button>
+          <button data-sel="export">导出</button>
+          <button data-sel="reveal">位置</button>
+          <button data-sel="delete">删除</button>
+          <button data-sel="restore" class="hidden">还原</button>
+          <button data-sel="purge" class="hidden danger">彻底删除</button>
+          <button data-sel="cancel">取消</button>
+        </div>
+      </div>
+
+      <div id="banner" class="hidden"></div>
+
+      <div id="viewport">
+        <div id="spacer"><div id="content"></div></div>
+        <div id="empty" class="hidden">
+          <div class="empty-icon"></div>
+          <div class="empty-title">这里还没有内容</div>
+          <div class="empty-sub">拖动照片 / 视频到这里，或点击右上角「导入」</div>
+        </div>
+      </div>
+      <div id="time-rail" class="hidden"></div>
+    </main>
+  </div>
+
+  <!-- 查看器 -->
+  <div id="viewer" class="overlay hidden">
+    <div class="viewer-top">
+      <button id="v-close" class="icon-btn" title="关闭 (Esc)">✕</button>
+      <div class="v-title">
+        <div id="v-name"></div>
+        <div id="v-meta"></div>
+      </div>
+      <div class="v-counter" id="v-counter"></div>
+      <button id="v-info-toggle" class="icon-btn" title="信息">ⓘ</button>
+    </div>
+
+    <div class="viewer-stage" id="v-stage">
+      <img id="v-img" alt="" />
+      <video id="v-video" loop playsinline preload="none"></video>
+      <div id="v-placeholder" class="hidden">
+        <div class="empty-icon"></div>
+        <div class="empty-title">该格式暂不支持预览</div>
+        <div class="empty-sub">原文件已完整保存，可在资源管理器中查看</div>
+      </div>
+      <div id="v-loading" class="spinner hidden"></div>
+
+      <!-- 电影式播放控制（视频播放页） -->
+      <div id="v-controls" class="v-controls hidden">
+        <div class="vc-progress">
+          <span class="vc-time"><span id="vc-cur">0:00</span><em>/</em><span id="vc-dur">0:00</span></span>
+          <input id="vc-seek" class="vc-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度" />
+        </div>
+        <div class="vc-row">
+          <button id="vc-back" class="vc-btn" title="后退 10 秒" aria-label="后退 10 秒">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 17l-6-5 6-5"/><path d="M19 17l-6-5 6-5"/></svg>
+            <span class="vc-label">后退<em>10s</em></span>
+          </button>
+          <button id="vc-toggle" class="vc-play" title="播放 / 暂停" aria-label="播放">
+            <svg class="i-play" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5.2v13.6L19 12z"/></svg>
+            <svg class="i-pause" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="7" y="5" width="3.6" height="14" rx="1"/><rect x="13.4" y="5" width="3.6" height="14" rx="1"/></svg>
+          </button>
+          <button id="vc-fwd" class="vc-btn" title="前进 10 秒" aria-label="前进 10 秒">
+            <span class="vc-label">前进<em>10s</em></span>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 17l6-5-6-5"/><path d="M5 17l6-5-6-5"/></svg>
+          </button>
+          <div class="vc-spacer"></div>
+          <div class="vc-speed-wrap">
+            <button id="vc-speed" class="vc-speed" title="倍数播放" aria-haspopup="menu" aria-expanded="false">
+              <span id="vc-speed-value">1.0x</span>
+            </button>
+            <div id="vc-speed-menu" class="vc-speed-menu hidden" role="menu" aria-label="倍数播放">
+              <div class="vc-speed-head">倍数播放</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button class="nav-arrow left" id="v-prev" title="上一张 (←)">‹</button>
+      <button class="nav-arrow right" id="v-next" title="下一张 (→)">›</button>
+    </div>
+
+    <div class="viewer-bottom">
+      <div class="v-actions">
+        <button id="v-fav">☆ 收藏</button>
+        <button id="v-tags"># 标签</button>
+        <button id="v-albums">▣ 相册</button>
+        <button id="v-crop">✂ 裁剪</button>
+        <button id="v-reveal">⌖ 位置</button>
+        <button id="v-delete" class="danger">⌫ 删除</button>
+      </div>
+    </div>
+
+    <aside id="v-info" class="v-info hidden"></aside>
+  </div>
+
+  <!-- 裁剪 -->
+  <div id="crop-modal" class="overlay hidden">
+    <div class="crop-box">
+      <header class="crop-head">
+        <div>
+          <div class="crop-title">裁剪</div>
+          <div class="crop-sub">裁剪结果会另存为新图并保存在当前目录，原图保持不变（实况照片生成新的裁剪实况）</div>
+        </div>
+        <button id="crop-close" class="icon-btn">✕</button>
+      </header>
+      <div class="crop-stage" id="crop-stage">
+        <img id="crop-img" alt="" />
+        <div id="crop-rect">
+          <div class="handle nw" data-h="nw"></div>
+          <div class="handle n" data-h="n"></div>
+          <div class="handle ne" data-h="ne"></div>
+          <div class="handle e" data-h="e"></div>
+          <div class="handle se" data-h="se"></div>
+          <div class="handle s" data-h="s"></div>
+          <div class="handle sw" data-h="sw"></div>
+          <div class="handle w" data-h="w"></div>
+        </div>
+      </div>
+      <footer class="crop-foot">
+        <div class="aspects" id="crop-aspects">
+          <button data-aspect="0" class="active">自由</button>
+          <button data-aspect="1">1:1</button>
+          <button data-aspect="1.3333">4:3</button>
+          <button data-aspect="1.5">3:2</button>
+          <button data-aspect="1.7778">16:9</button>
+        </div>
+        <div class="crop-size" id="crop-size"></div>
+        <div class="crop-actions">
+          <button id="crop-reset" class="ghost">重置选区</button>
+          <button id="crop-export" class="ghost">导出副本</button>
+          <button id="crop-cancel" class="ghost">取消</button>
+          <button id="crop-save" class="primary">保存裁剪</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 从手机导入 -->
+  <div id="phone-modal" class="overlay hidden">
+    <div class="phone-box">
+      <header class="phone-head">
+        <div>
+          <div class="phone-title">📱 从手机导入</div>
+          <div class="phone-sub">数据线连接 · 直接选择照片 / 实况 / 视频导入 · 全程无损</div>
+        </div>
+        <button id="phone-close" class="icon-btn">✕</button>
+      </header>
+
+      <section class="phone-section" id="section-wired">
+        <div class="phone-detect-state" id="phone-detect-state">正在检测设备…</div>
+        <div class="phone-toolbar hidden" id="phone-toolbar">
+          <label class="phone-check"><input type="checkbox" id="phone-select-all" /> 全选</label>
+          <span class="muted" id="phone-summary"></span>
+        </div>
+        <div class="phone-media-list hidden" id="phone-media-list"></div>
+        <div class="phone-note hidden" id="phone-detect-tip">
+          检测不到？请用数据线连接手机：iPhone 需解锁并点「信任此电脑」，Android 选择「文件传输（MTP）」模式。接好后点下方「重新检测」。
+        </div>
+        <div class="phone-import-row">
+          <button id="phone-refresh" class="ghost">重新检测</button>
+          <div class="spacer"></div>
+          <button id="phone-import-selected" class="primary" disabled>导入所选</button>
+        </div>
+      </section>
+
+      <section class="phone-section" id="section-wifi">
+        <div class="phone-wifi-head">
+          <div class="phone-wifi-title">免数据线 · WiFi 导入</div>
+          <button id="wifi-toggle" class="ghost">开启</button>
+        </div>
+        <div id="wifi-panel" class="hidden">
+          <div class="wifi-body">
+            <img id="wifi-qr" alt="扫码打开上传页" />
+            <div class="wifi-side">
+              <div class="wifi-url" id="wifi-url">—</div>
+              <div class="wifi-hint">手机与电脑连同一 WiFi，扫码后在手机浏览器里选择照片 / 视频上传，收到即自动入库（重复文件自动跳过）。</div>
+              <select id="wifi-ip" class="wifi-ip hidden" title="选择用于扫码的网卡地址"></select>
+              <div class="wifi-tips">
+                <button id="wifi-firewall" class="ghost wifi-fix">页面打不开？放行防火墙</button>
+                <span class="wifi-tip-text">需在弹出的授权框中点「是」</span>
+              </div>
+            </div>
+          </div>
+          <div id="wifi-log" class="wifi-log"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- 设置 -->
+  <div id="settings-modal" class="overlay hidden">
+    <div class="settings-box">
+      <header class="settings-head">
+        <div class="settings-title">设置</div>
+        <button id="settings-close" class="icon-btn">✕</button>
+      </header>
+      <div class="settings-body">
+        <section class="setting-item">
+          <div class="setting-label">存储位置</div>
+          <div class="setting-value" id="setting-root">—</div>
+          <div class="setting-row">
+            <button id="btn-open-root" class="ghost">打开目录</button>
+            <button id="btn-migrate" class="ghost">迁移到新位置</button>
+          </div>
+          <div class="setting-hint">支持 U 盘等可移动介质；迁移会逐文件做 SHA-256 校验，原库默认保留。</div>
+        </section>
+
+        <section class="setting-item">
+          <div class="setting-label">索引</div>
+          <div class="setting-row">
+            <button id="btn-rescan" class="ghost">重建索引</button>
+            <button id="btn-clear-cache" class="ghost">清理缓存</button>
+            <button id="btn-similar" class="ghost">查找相似照片</button>
+          </div>
+          <div class="setting-hint">索引与缩略图都可由原文件重建；清理缓存不影响原图与分类信息。相似照片按画面内容分组，适合清理连拍。</div>
+        </section>
+
+        <section class="setting-item">
+          <div class="setting-label">回收站</div>
+          <div class="setting-row">
+            <label class="setting-inline">自动清理
+              <select id="trash-auto-clean">
+                <option value="0">关闭</option>
+                <option value="7">7 天前删除的</option>
+                <option value="30">30 天前删除的</option>
+              </select>
+            </label>
+            <button id="btn-empty-trash" class="ghost">立即清空回收站</button>
+          </div>
+          <div class="setting-hint">开启后，每次启动应用时自动彻底删除回收站中超过期限的内容（不可恢复）。</div>
+        </section>
+
+        <section class="setting-item">
+          <div class="setting-label">像素保真</div>
+          <div class="setting-hint">
+            导入、存储、导出均保持原始字节；网格缩略图只做显示层缩放。裁剪为非破坏式，导出副本使用 PNG 无损格式。
+            实况视频若为 HEVC，播放时会生成仅用于显示的 H.264 兼容预览，原文件不被改写。
+          </div>
+        </section>
+
+        <section class="setting-item">
+          <div class="setting-label">关于</div>
+          <div class="setting-value" id="setting-about">照片仓库</div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 相似照片清理 -->
+  <div id="similar-modal" class="overlay hidden">
+    <div class="dialog similar-dialog">
+      <header class="dialog-head"><span>相似照片清理</span><button id="similar-close" class="icon-btn">✕</button></header>
+      <div class="dialog-body" id="similar-body"></div>
+    </div>
+  </div>
+
+  <!-- 相册选择 -->
+  <div id="album-modal" class="overlay hidden">
+    <div class="dialog">
+      <header class="dialog-head"><span id="album-modal-title">加入相册</span><button id="album-modal-close" class="icon-btn">✕</button></header>
+      <div class="dialog-body" id="album-modal-body"></div>
+      <footer class="dialog-foot">
+        <button id="album-create" class="ghost">新建相册</button>
+        <span class="spacer"></span>
+        <button id="album-cancel" class="ghost">取消</button>
+        <button id="album-apply" class="primary">应用</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 通用输入 -->
+  <div id="prompt-modal" class="overlay hidden">
+    <div class="dialog small">
+      <header class="dialog-head"><span id="prompt-title">输入</span><button id="prompt-close" class="icon-btn">✕</button></header>
+      <div class="dialog-body"><input id="prompt-input" type="text" /></div>
+      <footer class="dialog-foot">
+        <span class="spacer"></span>
+        <button id="prompt-cancel" class="ghost">取消</button>
+        <button id="prompt-ok" class="primary">确定</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 确认 -->
+  <div id="confirm-modal" class="overlay hidden">
+    <div class="dialog small">
+      <header class="dialog-head"><span id="confirm-title">确认</span></header>
+      <div class="dialog-body"><div id="confirm-text"></div></div>
+      <footer class="dialog-foot">
+        <span class="spacer"></span>
+        <button id="confirm-cancel" class="ghost">取消</button>
+        <button id="confirm-ok" class="primary danger">确定</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 右键菜单 -->
+  <div id="context-menu" class="context-menu hidden"></div>
+
+  <!-- 首次启动 -->
+  <div id="onboarding" class="overlay hidden">
+    <div class="onboard-card">
+      <div class="logo big"><span></span></div>
+      <h2>照片仓库</h2>
+      <p>像手机相册一样浏览、分类与回看。原件按字节保存，支持 iPhone / Android 动态照片与悬停播放。</p>
+      <p class="muted">请选择一个存储位置：可以放在本机磁盘，也可以放在 U 盘等可移动介质。位置以后可随时迁移。</p>
+      <div class="onboard-actions">
+        <button id="btn-choose-root" class="primary wide">选择存储位置</button>
+        <button id="btn-locate-root" class="ghost wide">查找已有照片仓库</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 拖放 -->
+  <div id="drop-overlay" class="hidden">
+    <div class="drop-inner">松开以导入到照片仓库</div>
+  </div>
+
+  <div id="toasts"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

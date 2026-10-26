@@ -1,0 +1,28 @@
+# 依赖
+node_modules/
+
+# 构建产物（安装包请通过 GitHub Releases 发布）
+dist/
+
+# 运行日志与本地数据
+*.log
+.photo-repo/
+
+# 环境与密钥
+.env
+.env.*
+*.pem
+*.pfx
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# 本地工具缓存
+.screenshots/
+.trae/
+.trae-html-share-packages/
