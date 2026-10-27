@@ -5,7 +5,7 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; img-src 'self' data: blob: http://127.0.0.1:*; media-src 'self' blob: http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self';" />
   <title>照片仓库</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=7" />
 </head>
 <body>
   <div id="shell">
@@ -61,6 +61,7 @@
         </div>
 
         <div class="toolbar">
+          <button id="btn-refresh" class="ghost" title="刷新（重建索引 + 后台实况检测）">🔄 刷新</button>
           <button id="btn-import" class="primary">导入</button>
           <button id="btn-import-folder" class="ghost">导入文件夹</button>
           <button id="btn-phone" class="ghost">📱 从手机导入</button>
@@ -325,6 +326,21 @@
           <div class="setting-label">关于</div>
           <div class="setting-value" id="setting-about">照片仓库</div>
         </section>
+
+        <section class="setting-item">
+          <div class="setting-label">在线更新</div>
+          <div id="update-status" class="setting-value">检查更新</div>
+          <div id="update-progress" class="update-progress hidden">
+            <div class="update-bar"><i id="update-bar-fill"></i></div>
+            <div class="update-pct" id="update-pct"></div>
+          </div>
+          <div class="setting-row">
+            <button id="btn-update-check" class="ghost">检查更新</button>
+            <button id="btn-update-download" class="primary hidden">下载更新</button>
+            <button id="btn-update-install" class="primary hidden">立即重启安装</button>
+          </div>
+          <div class="setting-hint">启用自动更新后，可在此面板手动检查并下载新版本。便携版（zip 解压的）不支持在线更新。</div>
+        </section>
       </div>
     </div>
   </div>
@@ -401,6 +417,6 @@
 
   <div id="toasts"></div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=7"></script>
 </body>
 </html>

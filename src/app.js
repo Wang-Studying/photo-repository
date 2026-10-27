@@ -243,16 +243,79 @@
     }, 220);
   }
 
+  // 导入速度采样（滑动平滑）：慢盘上让用户看得出「仍在推进」并给出剩余时间
+  const importRate = { at: 0, done: 0, rate: 0 };
+  let importActive = false;
+  let importCancelPending = false;
+  let motionBannerOn = false;
+
+  /** 取消导入按钮：导入（含扫描）期间常驻，点击后置灰直到主进程结束当前批次 */
+  function importCancelHtml() {
+    return `<button id="import-cancel-btn"${importCancelPending ? ' disabled' : ''}>${importCancelPending ? '正在取消…' : '取消导入'}</button>`;
+  }
+
+  function wireImportCancel() {
+    const btn = $('#import-cancel-btn');
+    if (btn) btn.onclick = requestImportCancel;
+  }
+
+  async function requestImportCancel() {
+    if (!importActive || importCancelPending) return;
+    importCancelPending = true;
+    const btn = $('#import-cancel-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '正在取消…'; }
+    const sub = $('#banner .import-progress-sub');
+    if (sub) sub.textContent = '正在取消：已开始的条目会继续完成，未开始的条目不再导入';
+    try { await api.cancelImport(); } catch {}
+  }
+
+  function fmtEta(sec) {
+    const s = Math.max(1, Math.round(sec));
+    if (s < 60) return `约 ${s} 秒`;
+    return `约 ${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  }
+
   function renderImportProgress(p) {
-    const pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
-    const name = String(p.current || '').split(/[\\/]/).pop();
     const el = $('#banner');
     el.className = '';
-    el.innerHTML = `<div class="import-progress">
-      <div class="import-progress-head"><span>正在导入 ${p.done}/${p.total} · ${pct}%</span><span class="import-current">${esc(name)}</span></div>
-      <div class="import-progress-track"><div class="import-progress-fill" style="width:${pct}%"></div></div>
-      <div class="import-progress-sub">新增 ${p.added} · 跳过 ${p.skipped}</div>
+    if (p.phase === '扫描') {
+      // 递归遍历目录本身在 U 盘上可能很慢：先给出「已找到 N 个」，避免进度条完全不动
+      el.innerHTML = `<div class="import-progress">
+      <div class="import-progress-head"><span>正在扫描文件…</span><span class="import-current">已找到 ${p.scanned || 0} 个</span></div>
+      <div class="import-progress-track indeterminate"><div class="import-progress-fill"></div></div>
+      <div class="import-progress-sub">${importCancelPending ? '正在取消：未开始的条目不再导入' : '扫描结束后开始复制'}${importCancelHtml()}</div>
     </div>`;
+      wireImportCancel();
+      return;
+    }
+
+    const t = Date.now();
+    if (!importRate.at) {
+      importRate.at = t;
+      importRate.done = p.done;
+    } else {
+      const dt = (t - importRate.at) / 1000;
+      if (dt >= 0.25) {
+        const inst = (p.done - importRate.done) / dt;
+        importRate.rate = importRate.rate ? importRate.rate * 0.6 + inst * 0.4 : inst;
+        importRate.at = t;
+        importRate.done = p.done;
+      }
+    }
+    const rate = importRate.rate > 0 ? importRate.rate : 0;
+    const remain = Math.max(0, p.total - p.done);
+    const speed = rate > 0 ? `${rate.toFixed(1)} 张/秒` : '';
+    const eta = rate > 0 && remain > 0 ? `剩余 ${fmtEta(remain / rate)}` : '';
+    const tail = [speed, eta].filter(Boolean).join(' · ');
+
+    const pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+    const name = String(p.current || '').split(/[\\/]/).pop();
+    el.innerHTML = `<div class="import-progress">
+      <div class="import-progress-head"><span>${importCancelPending ? '正在取消… 已完成' : '正在导入'} ${p.done}/${p.total} · ${pct}%</span><span class="import-current">${esc(name)}</span></div>
+      <div class="import-progress-track"><div class="import-progress-fill" style="width:${pct}%"></div></div>
+      <div class="import-progress-sub">${importCancelPending ? '未开始的条目不再导入' : `新增 ${p.added} · 跳过 ${p.skipped}${tail ? ` · ${tail}` : ''}`}${importCancelHtml()}</div>
+    </div>`;
+    wireImportCancel();
   }
 
   // ---------------- 侧栏 ----------------
@@ -620,6 +683,12 @@
       dur.className = 'badge duration';
       dur.textContent = fmtDuration(item.duration);
       el.appendChild(dur);
+    } else if (item.motionPending) {
+      // 内嵌实况在导入后后台补查，先给出可区分的状态，避免看起来像普通静态图
+      const badge = document.createElement('div');
+      badge.className = 'badge pending';
+      badge.textContent = '实况检测中';
+      el.appendChild(badge);
     } else if (item.displaySupported === false) {
       const badge = document.createElement('div');
       badge.className = 'badge unsupported';
@@ -906,6 +975,7 @@
     $('#v-name').textContent = item.name;
     const bits = [fmtDate(item.takenAt), item.width && item.height ? `${item.width} × ${item.height}` : '', fmtBytes(item.size)];
     if (item.type === 'live') bits.push(item.motionStatus === 'ready' ? '实况' : '实况（待支持）');
+    else if (item.motionPending) bits.push('实况检测中');
     if (item.type === 'video') bits.push(`视频 ${fmtDuration(item.duration)}`);
     if (item.crop) bits.push('已裁剪');
     $('#v-meta').textContent = bits.filter(Boolean).join(' · ');
@@ -1934,6 +2004,12 @@
       curEl.textContent = name;
       fill.style.width = `${pct}%`;
     } else if (p.phase === 'import') {
+      if (p.scanning) {
+        phaseEl.textContent = `第 2/2 步 · 正在扫描暂存文件…（已找到 ${p.scanning} 个）`;
+        sub.textContent = '';
+        curEl.textContent = '';
+        return;
+      }
       const pct = total ? Math.min(100, Math.round((p.done / total) * 100)) : 0;
       phaseEl.textContent = phoneCancelPending
         ? `正在完成已开始的条目 · 已入库 ${p.done}/${total}`
@@ -1979,9 +2055,11 @@
       if (s.failed && s.failed.length) parts.push(`失败 ${s.failed.length}`);
       if (res.data.cancelled) {
         // 取消态：报告「已完成 / 未导入」条数，未导入数即取消时尚未开始的条目，之后不再增加
-        const processed = typeof s.processed === 'number'
-          ? s.processed
-          : (s.added || 0) + (s.skipped || 0) + ((s.failed && s.failed.length) || 0);
+        const processed = typeof res.data.processed === 'number'
+          ? res.data.processed
+          : (typeof s.processed === 'number'
+            ? s.processed
+            : (s.added || 0) + (s.skipped || 0) + ((s.failed && s.failed.length) || 0));
         const remain = Math.max(0, picked.length - processed);
         const pct = picked.length ? Math.round((processed / picked.length) * 100) : 0;
         progBox.classList.add('cancelled');
@@ -2071,29 +2149,56 @@
   async function importPaths(paths) {
     if (!paths || !paths.length) return;
     if (!S.app || !S.app.hasLibrary) { await pickRoot(); return; }
-    setBanner(`<span id="banner-text">正在导入 ${paths.length} 个位置…</span>`);
+    importRate.at = 0;
+    importRate.done = 0;
+    importRate.rate = 0;
+    importActive = true;
+    importCancelPending = false;
+    document.body.classList.add('importing');
+    // 立刻给出可取消的进度外壳：慢盘扫描期间不用等第一条进度事件
+    setBanner(`<div class="import-progress">
+      <div class="import-progress-head"><span>正在准备导入 ${paths.length} 个位置…</span><span class="import-current"></span></div>
+      <div class="import-progress-track indeterminate"><div class="import-progress-fill"></div></div>
+      <div class="import-progress-sub">正在扫描文件…${importCancelHtml()}</div>
+    </div>`);
+    wireImportCancel();
     const off = api.on('import-progress', (p) => {
       renderImportProgress(p);
       if (p.item) mergeImportedItem(p.item);
     });
     try {
       const res = await api.importPaths(paths);
-      off();
       if (!res.ok) throw new Error(res.error || '导入失败');
       const s = res.data;
+      const failed = Array.isArray(s.failed) ? s.failed : [];
+      const processed = typeof s.processed === 'number'
+        ? s.processed
+        : (s.added || 0) + (s.skipped || 0) + failed.length;
       setBanner('');
       const parts = [`新增 ${s.added}`];
       if (s.skipped) parts.push(`重复跳过 ${s.skipped}`);
       if (s.live) parts.push(`实况 ${s.live}`);
-      if (s.failed.length) parts.push(`失败 ${s.failed.length}`);
-      toast(`导入完成：${parts.join(' · ')}`, s.failed.length ? 'error' : 'success');
-      if (s.failed.length) {
-        console.warn('导入失败明细', s.failed);
-        setBanner(`<span>有 ${s.failed.length} 个文件导入失败（已跳过，原文件未受影响），详情见 .photo-repo/logs/import.log</span>`, 'error');
+      if (failed.length) parts.push(`失败 ${failed.length}`);
+      if (s.cancelled) {
+        // 取消态：已完成并入库的条目照常保留，未开始复制的条目不再导入，不当成失败
+        const remain = Math.max(0, (s.total || 0) - processed);
+        const tail = remain ? `，未导入 ${remain} 项` : '';
+        toast(`已取消导入：完成 ${processed} 项${tail}（${parts.join(' · ')}）`, failed.length ? 'error' : 'success');
+        if (!s.total) toast('已取消导入（尚未开始复制）', 'success');
+      } else {
+        toast(`导入完成：${parts.join(' · ')}`, failed.length ? 'error' : 'success');
+        if (failed.length) {
+          console.warn('导入失败明细', failed);
+          setBanner(`<span>有 ${failed.length} 个文件导入失败（已跳过，原文件未受影响），详情见 .photo-repo/logs/import.log</span>`, 'error');
+        }
       }
     } catch (e) {
-      off();
       setBanner(`<span>${esc(e.message)}</span>`, 'error');
+    } finally {
+      off();
+      importActive = false;
+      importCancelPending = false;
+      document.body.classList.remove('importing');
     }
   }
 
@@ -2155,6 +2260,7 @@
       zoomSaveTimer = setTimeout(() => { api.setUi({ tileSize: S.tileSize }).catch(() => {}); }, 500);
     }, { passive: false });
 
+    $('#btn-refresh').onclick = rescan;
     $('#btn-import').onclick = async () => {
       const paths = await call(api.importDialog, 'files').catch(() => null);
       if (paths && paths.length) importPaths(paths);
@@ -2202,6 +2308,90 @@
         await call(api.setUi, { trashAutoCleanDays: days });
         toast(days ? `已开启：自动清理 ${days} 天前删除的内容` : '已关闭回收站自动清理', 'success');
       } catch {}
+    };
+
+    // ---------- 在线更新 ----------
+    const updateStatus = $('#update-status');
+    const updateProgress = $('#update-progress');
+    const updateBarFill = $('#update-bar-fill');
+    const updatePct = $('#update-pct');
+    const btnUpdateCheck = $('#btn-update-check');
+    const btnUpdateDownload = $('#btn-update-download');
+    const btnUpdateInstall = $('#btn-update-install');
+
+    function resetUpdateUI() {
+      updateProgress.classList.add('hidden');
+      btnUpdateCheck.classList.remove('hidden');
+      btnUpdateDownload.classList.add('hidden');
+      btnUpdateInstall.classList.add('hidden');
+      btnUpdateCheck.disabled = false;
+      btnUpdateDownload.disabled = false;
+      btnUpdateInstall.disabled = false;
+    }
+
+    api.on('update-status', (p) => {
+      resetUpdateUI();
+      if (p.status === 'checking') {
+        updateStatus.textContent = '正在检查更新…';
+        btnUpdateCheck.disabled = true;
+      } else if (p.status === 'available') {
+        updateStatus.textContent = `发现新版本 v${p.version}，当前 v${S.app?.appVersion || '1.0.0'}`;
+        btnUpdateDownload.classList.remove('hidden');
+      } else if (p.status === 'not-available') {
+        updateStatus.textContent = `✅ 已是最新版本（v${S.app?.appVersion || '1.0.2'}）`;
+      } else if (p.status === 'downloaded') {
+        updateStatus.textContent = `新版本 v${p.version} 已下载完成`;
+        btnUpdateInstall.classList.remove('hidden');
+      } else if (p.status === 'error') {
+        updateStatus.textContent = '更新检查失败：' + p.message;
+      }
+    });
+
+    api.on('update-progress', (p) => {
+      updateProgress.classList.remove('hidden');
+      const pct = p.percent || 0;
+      updateBarFill.style.width = pct + '%';
+      updatePct.textContent = pct + '%';
+    });
+
+    btnUpdateCheck.onclick = async () => {
+      resetUpdateUI();
+      updateStatus.textContent = '正在检查更新…';
+      btnUpdateCheck.disabled = true;
+      try {
+        const r = await api.update.check();
+        if (!r || !r.ok) throw new Error(r && r.error || '检查失败');
+        // 可靠兜底：就算事件没到达也能正确显示
+        const curVer = S.app?.appVersion || '1.0.2';
+        if (!r.updateAvailable) {
+          updateStatus.textContent = `✅ 已是最新版本（v${curVer}）`;
+        }
+        btnUpdateCheck.disabled = false;
+      } catch (e) {
+        updateStatus.textContent = '检查失败：' + (e.message || e);
+        btnUpdateCheck.disabled = false;
+      }
+    };
+
+    btnUpdateDownload.onclick = async () => {
+      btnUpdateDownload.disabled = true;
+      updateStatus.textContent = '正在下载更新…';
+      updateProgress.classList.remove('hidden');
+      updateBarFill.style.width = '0%';
+      updatePct.textContent = '0%';
+      try {
+        const r = await api.update.download();
+        if (!r || !r.ok) throw new Error(r && r.error || '下载失败');
+      } catch (e) {
+        updateStatus.textContent = '下载失败：' + (e.message || e);
+        btnUpdateDownload.disabled = false;
+      }
+    };
+
+    btnUpdateInstall.onclick = async () => {
+      const ok = confirm('即将重启并安装更新，确定吗？');
+      if (!ok) return;
+      try { await api.update.install(); } catch {}
     };
     $('#btn-empty-trash').onclick = async () => {
       const n = S.app?.library?.stats?.trash || 0;
@@ -2474,6 +2664,26 @@
     // 主进程事件
     api.on('library-changed', (data) => {
       applyState(data, { silent: true });
+    });
+    // 实况补充的单条更新：只改数据，不整页重绘，避免打断滚动
+    api.on('motion-updated', (item) => {
+      if (!item || !item.id) return;
+      const i = S.items.findIndex((x) => x.id === item.id);
+      if (i >= 0) S.items[i] = item;
+      S.itemMap.set(item.id, item);
+      const src = S.app?.library?.items;
+      if (Array.isArray(src)) {
+        const j = src.findIndex((x) => x.id === item.id);
+        if (j >= 0) src[j] = item;
+      }
+      if (S.viewer.open && S.viewer.currentId === item.id) refreshViewer();
+    });
+    // 后台实况识别进度：完全静默在后台运行，不再弹 banner 遮挡内容
+    api.on('motion-backfill', (p) => {
+      // 只记录 console，不影响 UI
+      if (p && p.running && p.done % 50 === 0 && p.done > 0) {
+        console.log(`实况后台识别 ${p.done}/${p.total}${p.live ? ` · 已识别 ${p.live}` : ''}`);
+      }
     });
     api.on('phone-thumb', (p) => {
       if (!p || !p.id || !p.url) return;

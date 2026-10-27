@@ -28,9 +28,15 @@ const PAGE_HTML = `<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0d1117; color: #e8ebf2; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 32px 20px; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
-  .sub { color: #9aa4bb; font-size: 13px; margin-bottom: 28px; }
+  .sub { color: #9aa4bb; font-size: 13px; margin-bottom: 8px; text-align:center; line-height:1.5; }
+  .tip { color: #7c8aaa; font-size: 11.5px; margin-bottom: 20px; text-align:center; }
   #pick { display: block; width: 100%; max-width: 420px; padding: 22px; border: 2px dashed #3c465c; border-radius: 16px; text-align: center; font-size: 17px; color: #b9cbff; background: rgba(124,156,255,.06); cursor: pointer; }
   #pick:active { background: rgba(124,156,255,.14); }
+  #pick.add { border-color: #2a4a7a; color: #7c9cff; background: rgba(124,156,255,.12); padding: 14px; font-size: 14px; margin-top: 12px; }
+  .tip { color: #f0c674; font-size: 12px; margin-bottom: 16px; text-align:center; padding: 8px 14px; background: rgba(240,198,116,.08); border: 1px solid rgba(240,198,116,.2); border-radius: 10px; line-height:1.6; }
+  #summary { width: 100%; max-width: 420px; margin-top: 16px; padding: 10px 14px; border-radius: 10px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); font-size: 12.5px; color: #b9cbff; display:none; }
+  #summary.show { display:block; }
+  #summary b { color: #7c9cff; font-weight:600; }
   #list { width: 100%; max-width: 420px; margin-top: 22px; display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
   .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -39,23 +45,55 @@ const PAGE_HTML = `<!DOCTYPE html>
   .err-note { width: 100%; max-width: 420px; font-size: 11.5px; color: #ff8a8a; padding: 0 8px 2px; margin-top: -4px; word-break: break-all; line-height: 1.5; }
   .bar { height: 3px; background: rgba(255,255,255,.1); border-radius: 2px; overflow: hidden; margin-top: 4px; }
   .bar i { display: block; height: 100%; background: #7c9cff; width: 0; transition: width .2s; }
+  .hidden { display: none !important; }
 </style></head><body>
 <h1>导入到照片仓库</h1>
-<div class="sub">选择照片或视频，保持本页面打开直到全部完成</div>
-<label id="pick">＋ 选择照片 / 视频<input id="file" type="file" multiple accept="image/*,video/*,.heic,.heif,.dng" style="display:none"></label>
+<div class="sub">保持本页面打开直到全部完成</div>
+<div class="tip">✨ 重复照片会自动跳过，可放心多次选择</div>
+<label id="pick">＋ 选择照片 / 视频（每次约100个）<input id="file" type="file" multiple accept="image/*,video/*,.heic,.heif,.dng" style="display:none"></label>
+<label id="pick" class="add hidden">＋ 继续添加更多<input id="file-more" type="file" multiple accept="image/*,video/*,.heic,.heif,.dng" style="display:none"></label>
+<div id="summary"></div>
 <div id="list"></div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('t') || '';
 const list = document.getElementById('list');
-document.getElementById('file').addEventListener('change', async (e) => {
-  const files = [...e.target.files];
-  e.target.value = '';
-  for (const f of files) await upload(f);
-});
-async function upload(f) {
+const summary = document.getElementById('summary');
+const pickMore = document.querySelector('#pick.add');
+
+const queue = [];
+const workers = [];
+const maxWorkers = 3;
+let total = 0, done = 0, dup = 0, fail = 0;
+const files = { byId: new Map(), nextId: 1 };
+
+function updateSummary() {
+  const remain = total - done;
+  if (total === 0) { summary.classList.remove('show'); return; }
+  summary.classList.add('show');
+  summary.innerHTML = '共 <b>' + total + '</b> 个 · 已完成 <b style="color:#6ee7a8">' + done + '</b>'
+    + (dup ? ' · 已存在 <b style="color:#f0c674">' + dup + '</b>' : '')
+    + (fail ? ' · 失败 <b style="color:#ff8a8a">' + fail + '</b>' : '')
+    + ' · 排队中 <b>' + remain + '</b>';
+}
+
+function addFiles(arr) {
+  for (const f of arr) {
+    const id = files.nextId++;
+    const rec = { id, file: f, row: null, state: 'pending' };
+    files.byId.set(id, rec);
+    queue.push(id);
+    renderRow(rec);
+  }
+  total += arr.length;
+  updateSummary();
+  if (total > arr.length) pickMore.classList.remove('hidden');
+  if (workers.length === 0) spawnWorkers();
+}
+
+function renderRow(rec) {
   const row = document.createElement('div'); row.className = 'row';
   const nm = document.createElement('div'); nm.className = 'name';
-  nm.textContent = f.name;
+  nm.textContent = rec.file.name;
   const right = document.createElement('div');
   const st = document.createElement('div'); st.className = 'st'; st.textContent = '等待';
   const barWrap = document.createElement('div'); barWrap.className = 'bar';
@@ -63,35 +101,73 @@ async function upload(f) {
   right.appendChild(st); right.appendChild(barWrap);
   right.style.width = '110px';
   row.appendChild(nm); row.appendChild(right); list.prepend(row);
-  try {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/upload?t=' + encodeURIComponent(TOKEN) + '&name=' + encodeURIComponent(f.name));
-      xhr.upload.onprogress = (e) => { if (e.lengthComputable) { bar.style.width = Math.round(e.loaded / e.total * 100) + '%'; st.textContent = Math.round(e.loaded / e.total * 100) + '%'; } };
-      xhr.onload = () => {
+  rec.row = row; rec.st = st; rec.bar = bar; rec.nm = nm;
+}
+
+async function spawnWorkers() {
+  while (workers.length < maxWorkers) {
+    const worker = (async () => {
+      while (queue.length) {
+        const id = queue.shift();
+        const rec = files.byId.get(id);
+        if (!rec || rec.state !== 'pending') continue;
+        rec.state = 'uploading';
+        rec.st.textContent = '上传中';
         try {
-          const r = JSON.parse(xhr.responseText);
-          if (!xhr.status || xhr.status >= 400 || !r.ok) return reject(new Error(r.error || ('HTTP ' + xhr.status)));
-          resolve(r);
-        } catch (err) { reject(err); }
-      };
-      xhr.onerror = () => reject(new Error('网络中断'));
-      xhr.send(f);
-    }).then((r) => {
-      st.className = 'st ' + (r.status === 'dup' ? 'dup' : 'done');
-      st.textContent = r.status === 'dup' ? '已存在' : '已入库';
-      bar.style.width = '100%';
-    });
-  } catch (err) {
-    st.className = 'st err';
-    st.textContent = '失败';
-    nm.title = err.message;
-    const note = document.createElement('div');
-    note.className = 'err-note';
-    note.textContent = err.message || '上传失败';
-    row.insertAdjacentElement('afterend', note);
+          const r = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/upload?t=' + encodeURIComponent(TOKEN) + '&name=' + encodeURIComponent(rec.file.name));
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) {
+                rec.bar.style.width = Math.round(e.loaded / e.total * 100) + '%';
+                rec.st.textContent = Math.round(e.loaded / e.total * 100) + '%';
+              }
+            };
+            xhr.onload = () => {
+              try {
+                const j = JSON.parse(xhr.responseText);
+                if (!xhr.status || xhr.status >= 400 || !j.ok) return reject(new Error(j.error || ('HTTP ' + xhr.status)));
+                resolve(j);
+              } catch (err) { reject(err); }
+            };
+            xhr.onerror = () => reject(new Error('网络中断'));
+            xhr.send(rec.file);
+          });
+          rec.st.className = 'st ' + (r.status === 'dup' ? 'dup' : 'done');
+          rec.st.textContent = r.status === 'dup' ? '已存在' : '已入库';
+          rec.bar.style.width = '100%';
+          done++;
+          if (r.status === 'dup') dup++;
+          else files.byId.delete(id);
+        } catch (err) {
+          rec.st.className = 'st err';
+          rec.st.textContent = '失败';
+          rec.nm.title = err.message;
+          const note = document.createElement('div');
+          note.className = 'err-note';
+          note.textContent = err.message || '上传失败';
+          rec.row.insertAdjacentElement('afterend', note);
+          fail++;
+          done++;
+          files.byId.delete(id);
+        }
+        rec.state = 'done';
+        updateSummary();
+      }
+      workers.splice(workers.indexOf(worker), 1);
+    })();
+    workers.push(worker);
   }
 }
+
+document.getElementById('file').addEventListener('change', (e) => {
+  const arr = [...e.target.files]; e.target.value = '';
+  addFiles(arr);
+});
+document.getElementById('file-more').addEventListener('change', (e) => {
+  const arr = [...e.target.files]; e.target.value = '';
+  addFiles(arr);
+});
 </script></body></html>`;
 
 class PhoneServer {

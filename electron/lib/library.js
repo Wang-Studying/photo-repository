@@ -20,7 +20,7 @@ const crypto = require('crypto');
 
 const {
   IMAGE_EXT, RAW_EXT, VIDEO_EXT, BROWSER_IMAGE_EXT, extOf, toNative, toPosix,
-  ensureDir, exists, sha256File, copyVerified, atomicWriteJson, readJson, uniqueFile,
+  ensureDir, exists, sha256File, hashFileWithSample, copyVerified, atomicWriteJson, readJson, uniqueFile,
   probeVideo, clamp01, round4, stemOf,
 } = require('./util');
 const media = require('./media');
@@ -62,17 +62,20 @@ function dateParts(ts) {
   return { y, m };
 }
 
-async function walk(dir, acc = [], depth = 0) {
+async function walk(dir, acc = [], depth = 0, onFile = null, shouldStop = null) {
   if (depth > 12) return acc;
+  if (shouldStop && shouldStop()) return acc;
   let entries = [];
   try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return acc; }
   for (const ent of entries) {
+    if (shouldStop && shouldStop()) return acc;
     const abs = path.join(dir, ent.name);
     if (ent.isDirectory()) {
       if (ent.name === '.photo-repo') continue;
-      await walk(abs, acc, depth + 1);
+      await walk(abs, acc, depth + 1, onFile, shouldStop);
     } else if (ent.isFile()) {
       acc.push(abs);
+      if (onFile) onFile(acc.length);
     }
   }
   return acc;
@@ -229,6 +232,7 @@ class Library {
       motionStatus: item.motionStatus || null,
       motionKind: item.motionKind || null,
       motionCodec: item.motionCodec || null,
+      motionPending: Boolean(item.motionPending),
       displaySupported: item.displaySupported !== false,
       videoCodec: item.videoCodec || null,
       gps: item.gps || null,
@@ -274,8 +278,19 @@ class Library {
   async expandPaths(paths, options = {}) {
     // 手机导入的暂存目录允许位于库内（同卷，入库时直接改名，不再产生第二份数据）
     const stagingDir = options.stagingDir ? path.resolve(options.stagingDir) : null;
+    const onScan = typeof options.onScan === 'function' ? options.onScan : null;
+    const shouldStop = typeof options.shouldStop === 'function' ? options.shouldStop : null;
     const files = [];
     const seen = new Set();
+    // 慢盘上递归遍历本身就可能很久：边遍历边上报已发现的文件数，避免进度条长时间无变化
+    let scanned = 0;
+    let lastEmit = 0;
+    const onFile = () => {
+      scanned += 1;
+      if (!onScan) return;
+      const t = Date.now();
+      if (t - lastEmit >= 180) { lastEmit = t; onScan(scanned); }
+    };
     for (const p of paths || []) {
       const abs = path.resolve(p);
       const insideRoot = abs === this.root || isInside(this.root, abs);
@@ -284,7 +299,7 @@ class Library {
       let st;
       try { st = await fsp.stat(abs); } catch { continue; }
       if (st.isDirectory()) {
-        const found = await walk(abs);
+        const found = await walk(abs, [], 0, onFile, shouldStop);
         for (const f of found) {
           const ext = extOf(f);
           if (IMAGE_EXT.has(ext) || RAW_EXT.has(ext) || VIDEO_EXT.has(ext)) {
@@ -293,6 +308,7 @@ class Library {
           }
         }
       } else if (st.isFile()) {
+        onFile();
         const ext = extOf(abs);
         if (IMAGE_EXT.has(ext) || RAW_EXT.has(ext) || VIDEO_EXT.has(ext)) {
           const key = abs.toLowerCase();
@@ -301,6 +317,7 @@ class Library {
       }
       if (files.length > MAX_IMPORT_FILES) break;
     }
+    if (onScan && scanned) onScan(scanned);
     return files.slice(0, MAX_IMPORT_FILES);
   }
 
@@ -318,20 +335,22 @@ class Library {
    * 全程不产生第二份数据；跨卷时回退为流式复制+哈希校验。
    * 返回 { hash, size, adopted }。
    */
-  async adoptVerified(src, dst) {
+  async adoptVerified(src, dst, sampleOpts = null) {
     if (!this.isStagedSrc(src)) {
-      const copied = await copyVerified(src, dst);
+      const copied = await copyVerified(src, dst, null, sampleOpts);
       return { ...copied, adopted: false };
     }
-    const hash = await sha256File(src);
+    const sampled = sampleOpts
+      ? await hashFileWithSample(src, sampleOpts.head, sampleOpts.tail, sampleOpts.onChunk)
+      : { hash: await sha256File(src), sample: null };
     const st = await fsp.stat(src);
     try {
       await fsp.rename(src, dst);
-      return { hash, size: st.size, adopted: true };
+      return { hash: sampled.hash, size: st.size, sample: sampled.sample, adopted: true };
     } catch (e) {
       // 少数同卷但被占用/权限受限的情况，退回复制并删除暂存件
       if (e && ['EXDEV', 'EPERM', 'EACCES', 'EBUSY'].includes(e.code)) {
-        const copied = await copyVerified(src, dst);
+        const copied = await copyVerified(src, dst, null, sampleOpts);
         await fsp.unlink(src).catch(() => {});
         return { ...copied, adopted: false };
       }
@@ -376,6 +395,8 @@ class Library {
       prevMotionRel: null,
       displaySupported: true,
       videoCodec: null,
+      motionPending: false,
+      motionHint: null,
       ...patch,
     };
   }
@@ -383,9 +404,18 @@ class Library {
   async importPaths(paths, onProgress = () => {}, options = {}) {
     this.assertAvailable();
     const shouldStop = typeof options.shouldStop === 'function' ? options.shouldStop : null;
-    const files = await this.expandPaths(paths, options);
+    const files = await this.expandPaths(paths, {
+      ...options,
+      onScan: (scanned) => onProgress({
+        phase: '扫描', scanned, done: 0, total: 0, added: 0, skipped: 0, current: '',
+      }),
+    });
     if (!files.length) {
-      return { added: 0, skipped: 0, failed: [], live: 0, total: 0, processed: 0, cancelled: false };
+      // 扫描阶段取消时没有文件，必须回报 cancelled，否则调用方会误判成「入库失败」
+      return { added: 0, skipped: 0, failed: [], live: 0, total: 0, processed: 0, cancelled: Boolean(shouldStop && shouldStop()) };
+    }
+    if (shouldStop && shouldStop()) {
+      return { added: 0, skipped: 0, failed: [], live: 0, total: 0, processed: 0, cancelled: true };
     }
 
     const imageFiles = [];
@@ -465,6 +495,69 @@ class Library {
     return summary;
   }
 
+  /**
+   * 导入结束后的实况补充：抽取导入时已登记的内嵌动态段，并补查采样不足的条目。
+   * 串行执行（并发 1），避免慢速 U 盘上与导入抢 I/O；可被 shouldStop 中断，下次启动继续。
+   * 期间不逐张写索引（整库重写在几千条时很重），按张数/时间批量落盘。
+   */
+  async backfillMotion(onProgress = () => {}, shouldStop = null) {
+    this.assertAvailable();
+    const pending = this.index.items.filter((i) => !i.deletedAt && i.motionPending && i.stillRel);
+    // 已登记 hint 的（确认为实况）先处理，用户能更快看到实况；剩下的才需要读文件判定
+    pending.sort((a, b) => (b.motionHint ? 1 : 0) - (a.motionHint ? 1 : 0));
+    const total = pending.length;
+    let checked = 0;
+    let live = 0;
+    let lastFlush = Date.now();
+    if (total) onProgress({ phase: '实况补充', done: 0, total, live: 0, item: null });
+    for (const item of pending) {
+      if (shouldStop && shouldStop()) break;
+      if (!this.isAvailable) break;
+      let found = item.motionHint || null;
+      try {
+        const abs = this.abs(item.stillRel);
+        if (!found && (await exists(abs))) {
+          found = await motion.detectEmbeddedMotionInFile(abs);
+        }
+        if (found) {
+          const { y, m } = dateParts(item.takenAt);
+          const liveDir = path.join(this.root, toNative(DIRS.live), y, m);
+          await ensureDir(liveDir);
+          const candidate = await this.reserveDest(liveDir, `${stemOf(item.name)}.mp4`);
+          const extracted = await motion.extractEmbeddedMotion(abs, candidate, found);
+          if (extracted.ok || extracted.detected) {
+            item.type = 'live';
+            item.motionRel = this.rel(candidate);
+            item.motionKind = extracted.kind;
+            item.motionStatus = extracted.ok ? 'ready' : 'unsupported';
+            item.motionCodec = extracted.codec || null;
+            item.motionDuration = extracted.duration || 0;
+            this._relMap.set(item.motionRel.toLowerCase(), item);
+            live += 1;
+          } else {
+            await fsp.unlink(candidate).catch(() => {});
+            this._reserved.delete(candidate.toLowerCase());
+          }
+        }
+        item.motionPending = false;
+        item.motionHint = null;
+        item.updatedAt = now();
+      } catch (e) {
+        item.motionPending = false;
+        item.motionHint = null;
+        console.warn(`实况补充失败：${item.name} :: ${e.message}`);
+      }
+      checked += 1;
+      if (checked % 50 === 0 || Date.now() - lastFlush > 5000) {
+        lastFlush = Date.now();
+        try { await this.flush(); } catch {}
+      }
+      onProgress({ phase: '实况补充', done: checked, total, live, item });
+    }
+    await this.flush();
+    return { checked, live, total };
+  }
+
   async importStill(src, pairedVideo) {
     const ext = extOf(src);
     const isRaw = RAW_EXT.has(ext);
@@ -474,7 +567,15 @@ class Library {
     const destDir = path.join(this.root, toNative(DIRS.originals), y, m);
     await ensureDir(destDir);
     const dest = await this.reserveDest(destDir, path.basename(src));
-    const copied = await this.adoptVerified(src, dest);
+    const isMotionCandidate = !isRaw && (ext === '.jpg' || ext === '.jpeg' || ext === '.heic' || ext === '.heif');
+    // 内嵌动态段只需看头/尾局部字节：复制或哈希本就要整读一遍源文件，顺带采样即可，
+    // 不再为探测额外读盘（U 盘/机械盘上几千张小文件的读放大很明显）。
+    // JPEG 追加型（Samsung）另走流式结构探测，视频再大也不需要回读文件。
+    const jpegProbe = isMotionCandidate ? motion.createJpegProbe(ext) : null;
+    const sampleOpts = isMotionCandidate
+      ? { ...motion.SAMPLE_WINDOW, onChunk: jpegProbe.feed }
+      : null;
+    const copied = await this.adoptVerified(src, dest, sampleOpts);
 
     if (this._hashMap.has(copied.hash) || this._pendingHashes.has(copied.hash)) {
       await fsp.unlink(dest).catch(() => {});
@@ -533,37 +634,19 @@ class Library {
           item.updatedAt = now();
           liveUnsupported = true;
         }
-      } else if (!isRaw && (ext === '.jpg' || ext === '.jpeg' || ext === '.heic' || ext === '.heif')) {
-        // 单文件内嵌动态段（Google / Samsung）
-        try {
-          const liveDir = path.join(this.root, toNative(DIRS.live), y, m);
-          await ensureDir(liveDir);
-          const stem = stemOf(item.name);
-          const candidate = await this.reserveDest(liveDir, `${stem}.mp4`);
-          const extracted = await motion.extractEmbeddedMotion(dest, candidate);
-          if (extracted.ok) {
-            item.type = 'live';
-            item.motionRel = this.rel(candidate);
-            item.motionKind = extracted.kind;
-            item.motionStatus = 'ready';
-            item.motionCodec = extracted.codec;
-            item.motionDuration = extracted.duration || 0;
-            item.updatedAt = now();
-            this._relMap.set(item.motionRel.toLowerCase(), item);
-          } else if (extracted.detected) {
-            // 已确认内嵌动态段但解码器不支持：按「实况（待支持）」归类，避免误判为静态图
-            item.type = 'live';
-            item.motionRel = this.rel(candidate);
-            item.motionKind = extracted.kind;
-            item.motionStatus = 'unsupported';
-            item.updatedAt = now();
-            this._relMap.set(item.motionRel.toLowerCase(), item);
-            liveUnsupported = true;
-          } else {
-            await fsp.unlink(candidate).catch(() => {});
-            this._reserved.delete(candidate.toLowerCase());
+      } else if (isMotionCandidate) {
+        // 用采样结果直接判定：普通静态图导入时就确定，无需后台再读文件；
+        // 真实况只登记 hint（抽取放后台），采样不足以判定时（HEIC 追加段等）留给后台补查。
+        const sampled = jpegProbe
+          ? { ...copied.sample, jpegMotion: jpegProbe.result(copied.size) }
+          : copied.sample;
+        const probe = motion.detectFromSample(sampled, copied.size, ext);
+        if (probe) {
+          item.motionPending = true;
+          if (probe !== motion.NEED_FILE) {
+            item.motionHint = { start: probe.start, length: probe.length, kind: probe.kind };
           }
-        } catch { /* 无动态段属正常情况 */ }
+        }
       }
 
       this.scheduleSave();

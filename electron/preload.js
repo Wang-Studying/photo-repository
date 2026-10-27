@@ -7,6 +7,8 @@ const CHANNELS = new Set([
   'rescan-progress',
   'migrate-progress',
   'library-changed',
+  'motion-updated',
+  'motion-backfill',
   'storage-state',
   'phone-thumb',
   'phone-thumb-status',
@@ -14,6 +16,8 @@ const CHANNELS = new Set([
   'phone-import-progress',
   'phone-wifi-progress',
   'similar-progress',
+  'update-status',
+  'update-progress',
 ]);
 
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
@@ -30,6 +34,7 @@ contextBridge.exposeInMainWorld('api', {
 
   importDialog: (mode) => invoke('library:import-dialog', mode),
   importPaths: (paths) => invoke('library:import-paths', paths),
+  cancelImport: () => invoke('library:cancel-import'),
   rescan: () => invoke('library:rescan'),
   updateItem: (id, patch) => invoke('library:update-item', id, patch),
   itemExif: (id) => invoke('library:item-exif', id),
@@ -60,6 +65,12 @@ contextBridge.exposeInMainWorld('api', {
     wifiStart: (ip) => invoke('phone-wifi:start', ip),
     wifiStop: () => invoke('phone-wifi:stop'),
     wifiFirewall: () => invoke('phone-wifi:allow-firewall'),
+  },
+
+  update: {
+    check: () => invoke('update:check'),
+    download: () => invoke('update:download'),
+    install: () => invoke('update:install'),
   },
 
   getPathForFile: (file) => {

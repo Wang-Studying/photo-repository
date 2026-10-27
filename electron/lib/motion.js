@@ -15,8 +15,9 @@ const { ensureDir, probeVideo, runFfmpeg, exists, stemOf, extOf } = require('./u
 const IPHONE_VIDEO_EXT = new Set(['.mov', '.mp4']);
 const MIN_MOTION_BYTES = 1024;
 // 内嵌探测的分段读取窗口：XMP 只在头部；追加 MP4 通过 JPEG EOI / HEIC 顶层 box 定位
-const HEAD_SCAN_BYTES = 512 * 1024;
-const TAIL_SCAN_BYTES = 256 * 1024;
+// 窗口尽量小：慢速 U 盘/机械盘上每张照片多读 1MB 都会显著拖慢批量导入，必要时再逐级放大
+const HEAD_SCAN_BYTES = 256 * 1024;
+const TAIL_SCAN_BYTES = 64 * 1024;
 const EOI_PADDING = 64; // JPEG EOI 之后允许的尾部填充字节数
 
 function inspectXmp(buffer) {
@@ -213,6 +214,75 @@ async function findHeicAppendageStart(fh, size) {
   return -1;
 }
 
+/** 流式探测时保留的跨块字节数（够「EOI + 填充 + ftyp box 头」的结构判断） */
+const PROBE_CARRY_BYTES = 96;
+
+/**
+ * 流式探测 JPEG 尾部追加的 MP4（Samsung 等）：在复制/哈希的逐块读取中
+ * 扫描「JPEG EOI + 合法 ftyp 头」的结构边界，不依赖尾部窗口大小，
+ * 因此追加视频很大时也不需要再读一遍文件。ext 非 JPEG 时为空实现。
+ */
+function createJpegProbe(ext) {
+  const isJpeg = ext === '.jpg' || ext === '.jpeg';
+  let carry = Buffer.alloc(0);
+  let total = 0;
+  let hit = null;
+  return {
+    feed(chunk) {
+      const curSize = total + chunk.length;
+      if (isJpeg) {
+        // 只在块首附近拼接前一块的尾部，避免每块整段 concat 带来的额外拷贝
+        const edge = Math.min(chunk.length, PROBE_CARRY_BYTES + 16);
+        const seam = carry.length ? Buffer.concat([carry, chunk.subarray(0, edge)]) : null;
+        let found = seam ? findAppendedAfterJpegEoi(seam, total - carry.length, curSize) : null;
+        if (!found) found = findAppendedAfterJpegEoi(chunk, total, curSize);
+        if (found) hit = { start: found.start, kind: found.kind };
+        const keep = Math.min(chunk.length, PROBE_CARRY_BYTES);
+        carry = Buffer.from(chunk.subarray(chunk.length - keep));
+      }
+      total = curSize;
+    },
+    result(fileSize) {
+      if (!hit) return null;
+      const length = fileSize - hit.start;
+      if (length <= MIN_MOTION_BYTES) return null;
+      return { start: hit.start, length, kind: hit.kind };
+    },
+  };
+}
+
+/**
+ * 仅凭复制/哈希时顺带采集的头尾字节判断是否存在内嵌动态段：
+ * - 返回 { start, length, kind } → 命中
+ * - 返回 null → 确认是普通静态图
+ * - 返回 NEED_FILE → 采样窗口不足以判定（HEIC 追加段、结构异常），需回退读文件
+ */
+const NEED_FILE = 'need-file';
+
+function detectFromSample(sample, fileSize, ext) {
+  if (!sample || !fileSize || fileSize <= MIN_MOTION_BYTES) return null;
+  const headBuf = sample.head && sample.head.length ? sample.head : null;
+  if (headBuf) {
+    const xmp = inspectXmpHead(headBuf.toString('latin1'), fileSize);
+    if (xmp) return xmp;
+  }
+  if (ext === '.jpg' || ext === '.jpeg') {
+    // 流式结构探测已确认的追加段：无需再看尾部窗口
+    if (sample.jpegMotion) return sample.jpegMotion;
+    const tail = sample.tail && sample.tail.length ? sample.tail : null;
+    if (!tail) return NEED_FILE;
+    const tailStart = fileSize - tail.length;
+    const found = findAppendedAfterJpegEoi(tail, tailStart, fileSize);
+    if (found) return found;
+    // 尾部 EOI 紧贴文件末尾 → 普通静态照片
+    const eoiEnd = findJpegEoiEnd(tail, tailStart);
+    if (eoiEnd >= 0 && fileSize - eoiEnd <= EOI_PADDING) return null;
+    if (tailStart === 0) return detectEmbeddedMotion(tail);
+    return NEED_FILE;
+  }
+  return NEED_FILE;
+}
+
 /**
  * 快速定位内嵌动态段：命中或确认无时都只读头/尾小窗口；
  * 仅在结构异常等少见情形下退回整文件读取，保证检测结果与全量扫描一致。
@@ -284,16 +354,19 @@ async function sliceToFile(srcFile, start, length, destFile) {
 /**
  * 从图片中抽取内嵌动态视频；成功返回 {ok, codec, duration, kind}
  * 抽取件若因尾部杂质无法解码，则用无损 remux 清洗（内容流不重编码）。
+ * preFound 可由调用方传入已完成的探测结果，避免重复读一遍头尾窗口。
  */
-async function extractEmbeddedMotion(absImage, destFile) {
-  let found;
-  try {
-    const st = await fsp.stat(absImage);
-    if (st.size > 1024 * 1024 * 1024) return { ok: false, reason: '文件过大，跳过内嵌扫描' };
-    // 快速探测：普通静态照片只读头/尾小窗口，不再整读文件
-    found = await detectEmbeddedMotionInFile(absImage);
-  } catch (e) {
-    return { ok: false, reason: String(e) };
+async function extractEmbeddedMotion(absImage, destFile, preFound = null) {
+  let found = preFound;
+  if (!found) {
+    try {
+      const st = await fsp.stat(absImage);
+      if (st.size > 1024 * 1024 * 1024) return { ok: false, reason: '文件过大，跳过内嵌扫描' };
+      // 快速探测：普通静态照片只读头/尾小窗口，不再整读文件
+      found = await detectEmbeddedMotionInFile(absImage);
+    } catch (e) {
+      return { ok: false, reason: String(e) };
+    }
   }
 
   if (!found) return { ok: false, reason: '未发现内嵌动态段' };
@@ -340,6 +413,10 @@ function isLiveVideoPartner(imagePath, videoPath) {
   return stemOf(imagePath).toLowerCase() === stemOf(videoPath).toLowerCase();
 }
 
+/** 复制/哈希时可顺带采样的头尾窗口（太小会漏判，太大增加内存与拷贝开销） */
+const SAMPLE_WINDOW = { head: HEAD_SCAN_BYTES, tail: TAIL_SCAN_BYTES };
+
 module.exports = {
-  detectEmbeddedMotion, detectEmbeddedMotionInFile, extractEmbeddedMotion, pairKey, isLiveVideoPartner, inspectXmp,
+  detectEmbeddedMotion, detectEmbeddedMotionInFile, detectFromSample, createJpegProbe,
+  extractEmbeddedMotion, pairKey, isLiveVideoPartner, inspectXmp, SAMPLE_WINDOW, NEED_FILE,
 };

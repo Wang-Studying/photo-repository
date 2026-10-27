@@ -76,18 +76,84 @@ async function sha256File(file) {
 }
 
 /**
+ * 头/尾字节采样器：在复制或哈希的单遍读取里顺带截取少量字节，
+ * 供实况探测等只需局部内容的判定复用，避免复制完再读一遍文件。
+ */
+function createSampler(headBytes = 0, tailBytes = 0, onChunk = null) {
+  if (!headBytes && !tailBytes && !onChunk) return null;
+  const headParts = [];
+  let headLen = 0;
+  const tail = tailBytes > 0 ? Buffer.allocUnsafe(tailBytes) : null;
+  let tailFilled = 0;
+  return {
+    feed(chunk) {
+      if (onChunk) onChunk(chunk);
+      if (headLen < headBytes) {
+        const take = chunk.subarray(0, Math.min(chunk.length, headBytes - headLen));
+        headParts.push(Buffer.from(take));
+        headLen += take.length;
+      }
+      if (!tail) return;
+      // 始终右对齐保存最近 tailBytes 字节：result() 从尾部读取有效区
+      if (chunk.length >= tailBytes) {
+        chunk.copy(tail, 0, chunk.length - tailBytes);
+        tailFilled = tailBytes;
+      } else {
+        const at = tailBytes - chunk.length;
+        const keep = Math.min(tailFilled, at);
+        if (keep > 0) tail.copy(tail, at - keep, tailFilled - keep, tailFilled);
+        chunk.copy(tail, at);
+        tailFilled = Math.min(tailBytes, tailFilled + chunk.length);
+      }
+    },
+    result() {
+      return {
+        head: headLen ? Buffer.concat(headParts, headLen) : Buffer.alloc(0),
+        tail: tail ? Buffer.from(tail.subarray(tailBytes - tailFilled)) : Buffer.alloc(0),
+      };
+    },
+  };
+}
+
+/**
+ * 只读一遍文件：算 SHA-256 的同时采样头/尾（用于同卷改名入库等不需要写第二份的场景）。
+ * 返回 { hash, size, sample }。
+ */
+async function hashFileWithSample(file, headBytes = 0, tailBytes = 0, onChunk = null) {
+  const hash = crypto.createHash('sha256');
+  const sampler = createSampler(headBytes, tailBytes, onChunk);
+  let size = 0;
+  await new Promise((resolve, reject) => {
+    const s = fs.createReadStream(file);
+    s.on('data', (c) => {
+      hash.update(c);
+      size += c.length;
+      if (sampler) sampler.feed(c);
+    });
+    s.on('error', reject);
+    s.on('end', resolve);
+  });
+  return { hash: hash.digest('hex'), size, sample: sampler ? sampler.result() : null };
+}
+
+/**
  * 字节级原样复制：流式复制的同时顺带算出 SHA-256（单遍读源文件，省去复制后再整读一遍）。
  * 传入 expectedHash 时仍会再读一次落盘件做严格校验（用于迁移等要求验证写结果的场景）。
- * 返回 { hash, size }，失败不留下半成品。
+ * sampleOpts = { head, tail } 时顺带采样头尾字节，不额外读盘。
+ * 返回 { hash, size, sample }，失败不留下半成品。
  */
-async function copyVerified(src, dst, expectedHash = null) {
+async function copyVerified(src, dst, expectedHash = null, sampleOpts = null) {
   const tmp = `${dst}.part-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sampler = sampleOpts ? createSampler(sampleOpts.head, sampleOpts.tail, sampleOpts.onChunk) : null;
   try {
     const hash = crypto.createHash('sha256');
     await new Promise((resolve, reject) => {
       const rs = fs.createReadStream(src);
       const ws = fs.createWriteStream(tmp);
-      rs.on('data', (c) => hash.update(c));
+      rs.on('data', (c) => {
+        hash.update(c);
+        if (sampler) sampler.feed(c);
+      });
       rs.on('error', reject);
       ws.on('error', reject);
       // 等 close（而非 finish）：确保 Windows 上句柄已释放，rename 不会 EPERM/EBUSY
@@ -104,7 +170,7 @@ async function copyVerified(src, dst, expectedHash = null) {
     }
     const st = await fsp.stat(tmp);
     await fsp.rename(tmp, dst);
-    return { hash: srcHash, size: st.size };
+    return { hash: srcHash, size: st.size, sample: sampler ? sampler.result() : null };
   } catch (e) {
     await fsp.unlink(tmp).catch(() => {});
     throw e;
@@ -224,6 +290,6 @@ module.exports = {
   ffmpegPath,
   IMAGE_EXT, RAW_EXT, VIDEO_EXT, BROWSER_IMAGE_EXT, BROWSER_VIDEO_CODECS,
   extOf, toNative, toPosix, mimeOf, ensureDir, exists, stemOf,
-  sha256File, copyVerified, atomicWriteJson, readJson, uniqueFile,
+  sha256File, hashFileWithSample, copyVerified, atomicWriteJson, readJson, uniqueFile,
   runFfmpeg, probeVideo, round4, clamp01, formatBytes,
 };

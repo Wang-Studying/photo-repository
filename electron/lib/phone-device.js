@@ -180,13 +180,15 @@ function Write-CopyProgress([int64]$fileDone, [int64]$fileTotal, [bool]$force) {
 }
 
 # 等待异步复制落地：文件出现后按体积判断完成；长时间无增长视为结束，避免无限等待
-function Wait-Copy([string]$Target, [int64]$Expected) {
+function Wait-Copy([string]$Target, [int64]$Expected, [string]$Cancel = '') {
   $start = Get-Date
   $lastLen = [int64]-1
   $lastChange = $start
   $started = $false
   while ($true) {
     [System.Windows.Forms.Application]::DoEvents()
+    # 允许取消在单个文件等待期间生效：用户点取消后不再等这个文件落地
+    if ($Cancel -and (Test-Path -LiteralPath $Cancel)) { return 'CANCELLED' }
     $has = Test-Path -LiteralPath $Target
     $len = [int64]0
     if ($has) {
@@ -201,16 +203,16 @@ function Wait-Copy([string]$Target, [int64]$Expected) {
       if ($len -ne $lastLen) { $lastLen = $len; $lastChange = $now }
     }
     if ($started) {
-      $idle = if ($lastLen -gt 0) { 45 } else { 120 }
+      $idle = if ($lastLen -gt 0) { 15 } else { 45 }
       if (($now - $lastChange).TotalSeconds -ge $idle) {
         if ($Expected -gt 0) { if ($len -ge $Expected) { return 'OK' } else { return 'PARTIAL' } }
         if ($len -gt 0) { return 'OK' }
         return 'NONE'
       }
-    } elseif (($now - $start).TotalSeconds -ge 30) {
+    } elseif (($now - $start).TotalSeconds -ge 20) {
       return 'NONE'
     }
-    if (($now - $start).TotalSeconds -ge 1800) { return 'TIMEOUT' }
+    if (($now - $start).TotalSeconds -ge 120) { return 'TIMEOUT' }
     Start-Sleep -Milliseconds 120
   }
 }
@@ -412,21 +414,26 @@ public static class PhoneCopy
         Write-CopyProgress 0 $expected $true
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
 
-        # 策略一：Shell 命名空间 CopyHere（完全静默，复制过程靠 Wait-Copy 泵消息）
-        # 1556 = FOF_SILENT(0x4) | FOF_NOCONFIRMATION(0x10) | FOF_NOCONFIRMMKDIR(0x200) | FOF_NOERRORUI(0x400)
-        # 缺 FOF_NOERRORUI 时设备端异常会弹出系统「正在复制…」/错误对话框
-        try {
-          $destNS = $shell.NameSpace($destDir)
-          if ($destNS) { $destNS.CopyHere($item, 1556) }
-        } catch {}
-        $state = Wait-Copy $target $expected
+        # 策略一（首选）：IFileOperation.PerformOperations
+        # 真遵守 FOF_NOERRORUI：WPD 设备错误不会弹系统对话框阻塞，而是同步返回错误码
+        try { [PhoneCopy]::Copy($item, $destDir, $fileName) | Out-Null } catch {}
+        $state = Wait-Copy $target $Expected $Cancel
 
-        # 策略二：IFileOperation 同步复制（CopyHere 不落地时使用）
-        if ($state -ne 'OK') {
+        # 策略二（兜底）：Shell 命名空间 CopyHere
+        # CopyHere 是异步的，理论上静默，但 WPD 设备遇到 COM 错误时 Shell.Application 偶尔会
+        # 绕过 FOF_NOERRORUI 弹出系统级错误对话框，阻塞 PowerShell 进程直到用户手动关闭。
+        # 因此只在 IFileOperation 失败时作为最后手段。
+        if ($state -eq 'NONE' -or $state -eq 'TIMEOUT') {
           try { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } } catch {}
-          try { [PhoneCopy]::Copy($item, $destDir, $fileName) | Out-Null } catch {}
-          $state = Wait-Copy $target $expected
+          try {
+            $destNS = $shell.NameSpace($destDir)
+            if ($destNS) { $destNS.CopyHere($item, 1556) }
+          } catch {}
+          $state = Wait-Copy $target $Expected $Cancel
         }
+
+        # 取消检测：用户点了取消，不等当前条目了，跳到下一组边界处理
+        if ($state -eq 'CANCELLED') { $result.cancelled = $true; break }
 
         $done = ($state -eq 'OK')
         if (-not $done -and (Test-Path -LiteralPath $target)) {
@@ -694,6 +701,32 @@ function runPowerShell(script, extraArgs, timeout) {
   });
 }
 
+/** 运行 PowerShell 脚本，返回 { cp, promise }。允许调用方直接管理子进程（kill） */
+function spawnPowerShell(script, extraArgs) {
+  const tag = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const scriptPath = path.join(os.tmpdir(), `pr-phone-${tag}.ps1`);
+  const cleanupFiles = [scriptPath];
+  fs.writeFileSync(scriptPath, `\uFEFF${script}`, 'utf8');
+  const args = [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', scriptPath,
+    ...extraArgs,
+  ];
+  const cp = execFile('powershell.exe', args, { windowsHide: true });
+  const promise = new Promise((resolve, reject) => {
+    cp.on('error', reject);
+    cp.on('exit', (code, signal) => {
+      for (const f of cleanupFiles) { try { fs.unlinkSync(f); } catch {} }
+      if (code === 0) resolve(); else {
+        const err = new Error(`PowerShell 退出码 ${code}`);
+        err.code = code; err.signal = signal;
+        reject(err);
+      }
+    });
+  });
+  return { cp, promise };
+}
+
 async function readResult(outPath) {
   const raw = fs.readFileSync(outPath, 'utf8').replace(/^\uFEFF/, '');
   return JSON.parse(raw);
@@ -747,30 +780,72 @@ async function copyPhoneFiles(items, destDir, onProgress, opts = {}) {
   if (progPath) args.push('-Progress', progPath);
   if (cancelPath) args.push('-Cancel', cancelPath);
   let progTimer = null;
+  let watchdogTimer = null;
+  let lastProgressAt = Date.now();
+  let cp = null;
+  let killed = false;
   try {
+    const spawned = spawnPowerShell(PS_COPY, args);
+    cp = spawned.cp;
+    // 看门狗：PowerShell 可能因 Shell.CopyHere 阻塞弹系统错误对话框，
+    // 或者设备忙导致长时间无进度。超过 15 秒无任何进度变化 → kill 进程，避免整批卡死
+    if (progPath) {
+      watchdogTimer = setInterval(() => {
+        if (!lastProgressAt || killed) return;
+        if (Date.now() - lastProgressAt > 15000) {
+          killed = true;
+          // 给 PowerShell 一个短暂的窗口把当前已完成的条目写进 outPath
+          try { cp.kill('SIGTERM'); } catch {}
+        }
+      }, 500);
+    }
     if (progPath) {
       let lastRaw = '';
       progTimer = setInterval(() => {
         let raw = '';
         try { raw = fs.readFileSync(progPath, 'utf8'); } catch { return; }
-        if (!raw || raw === lastRaw) return;
-        lastRaw = raw;
+        if (!raw) return;
+        if (raw !== lastRaw) { lastProgressAt = Date.now(); lastRaw = raw; }
         try { onProgress(JSON.parse(raw.replace(/^\uFEFF/, ''))); } catch {}
       }, 200);
     }
-    await runPowerShell(PS_COPY, args, 60 * 60 * 1000);
-    const data = await readResult(outPath);
+    let promiseResolved = false;
+    const race = Promise.race([
+      spawned.promise.then(() => { promiseResolved = true; }),
+      new Promise((resolve) => setTimeout(resolve, 1200)).then(() => {
+        if (!promiseResolved && killed) {
+          // 已 kill，给 PowerShell 最后一点时间写出 JSON 结果再放弃
+          promiseResolved = true;
+          try { cp.kill('SIGKILL'); } catch {}
+        }
+      }),
+    ]);
+    await spawned.promise.catch(() => {});
+    // 即使 PowerShell 被 kill（异常退出码），也尝试读 outPath 里已有的部分结果
+    const data = await (async () => {
+      try {
+        await new Promise((r) => setTimeout(r, 50));
+        const raw = fs.readFileSync(outPath, 'utf8').replace(/^\uFEFF/, '');
+        return JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    })();
+    const base = data || {};
     return {
-      ok: Boolean(data.ok),
-      cancelled: Boolean(data.cancelled),
-      copied: Array.isArray(data.copied) ? data.copied : (data.copied ? [data.copied] : []),
-      failed: Array.isArray(data.failed) ? data.failed : (data.failed ? [data.failed] : []),
-      error: data.error || '',
+      ok: killed ? false : Boolean(base.ok),
+      cancelled: killed ? false : Boolean(base.cancelled),
+      copied: Array.isArray(base.copied) ? base.copied : (base.copied ? [base.copied] : []),
+      failed: Array.isArray(base.failed) ? base.failed : (base.failed ? [base.failed] : []),
+      error: killed ? 'BUSY' : (base.error || ''),
     };
   } catch (e) {
-    return { ok: false, cancelled: false, copied: [], failed: [], error: e.killed ? 'TIMEOUT' : (e.message || 'COPY_FAILED') };
+    let err = e.message || 'COPY_FAILED';
+    if (killed) err = 'BUSY';
+    return { ok: false, cancelled: false, copied: [], failed: [], error: err };
   } finally {
     if (progTimer) clearInterval(progTimer);
+    if (watchdogTimer) clearInterval(watchdogTimer);
     try { fs.unlinkSync(outPath); } catch {}
     try { fs.unlinkSync(planPath); } catch {}
     if (progPath) { try { fs.unlinkSync(progPath); } catch {} }
